@@ -104,4 +104,40 @@ describe('session format guard through the assembled app', () => {
     expect(result.stderr).toContain('(raw log: ')
     expect(result.stderr).toContain(sessionPath.slice(sessionPath.indexOf('/.sessions/')))
   }, LOADER_SMOKE_TEST_TIMEOUT_MS)
+
+  it('keeps a required extension log readable but refuses live resume without its scoped registration', async () => {
+    const result = await runLoaderSmoke({
+      label: 'required extension resume refusal',
+      tempDirPrefix: 'dsh-format-guard-extension-',
+      binScript,
+      libBinScript: binScript,
+      configPath,
+      binArgs: [configPath, 'Try to resume.'],
+      tsconfigPath,
+      env: { DSH_SNAPSHOT_FILE: replayFixture },
+      expectedExitCode: 1,
+      prepare: async (runCwd) => {
+        await seedSession(join(runCwd, '.sessions'), runCwd, SESSION_FORMAT_VERSION, [
+          ...closedTurn(),
+          {
+            type: 'session-extension/event',
+            seq: 2,
+            time: 3,
+            data: {
+              owner: '@test/required-extension',
+              eventType: 'test/state',
+              schemaVersion: 1,
+              requirement: 'required',
+              payload: { value: 1 },
+            },
+          },
+        ])
+      },
+    })
+    expect(result.stderr).toContain(
+      `session "${sessionId}" requires compatible session extensions: @test/required-extension/test/state@1 is not registered`,
+    )
+    expect(result.stderr).not.toContain('unsupported session format')
+    expect(result.stderr).not.toContain('corrupt')
+  }, LOADER_SMOKE_TEST_TIMEOUT_MS)
 })

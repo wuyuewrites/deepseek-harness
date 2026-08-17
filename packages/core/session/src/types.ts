@@ -227,6 +227,44 @@ export interface RequestContext {
  */
 export type RequestHeaderReason = 'initial' | 'resume' | 'change'
 
+/** Whether a session-extension event may be ignored when its owner is unavailable. */
+export type SessionExtensionRequirement = 'required' | 'ignorable'
+
+/**
+ * Merge-extensible payload map for out-of-repository session extensions.
+ * Plugins add one namespaced key and register its durable descriptor through
+ * `ctx.sessions.registerEventExtension()` before appending that payload.
+ */
+export interface SessionExtensionMap {}
+
+type DeclaredSessionExtensionType = Extract<keyof SessionExtensionMap, string>
+
+/** A plugin-owned session-extension key; the core package remains usable before declaration merging. */
+export type SessionExtensionType =
+  [DeclaredSessionExtensionType] extends [never] ? string : DeclaredSessionExtensionType
+
+/** Payload registered for one known extension key, or generic JSON for an untyped key. */
+export type SessionExtensionPayload<K extends SessionExtensionType> =
+  K extends keyof SessionExtensionMap ? SessionExtensionMap[K] : JsonValue
+
+/**
+ * Self-describing payload carried by the core-known `session-extension/event`.
+ * The owner interprets `payload`; DSH uses the remaining fields to decide
+ * whether a composition may continue the session.
+ */
+export interface SessionExtensionEventData {
+  /** Stable owner identity, normally the contributing npm package name. */
+  owner: string
+  /** Owner-defined event identity. */
+  eventType: string
+  /** Positive safe-integer version of the owner-defined payload. */
+  schemaVersion: number
+  /** Whether a composition without a compatible registration may continue. */
+  requirement: SessionExtensionRequirement
+  /** Lossless JSON interpreted only by the registered owner. */
+  payload: JsonValue
+}
+
 /**
  * The merge-extensible, append-only source of truth for an agent interaction.
  * Message history is derived from this log. Every event is lossless JSON and
@@ -334,6 +372,13 @@ export interface SessionEventMap {
    * so tolerating concurrent writers needs a signal beyond the log.
    */
   'session/end-seed': Record<string, never>
+  /**
+   * Log-only carrier for events owned by out-of-repository plugins. Every
+   * record is self-describing so suffix reads never depend on an earlier
+   * declaration. Required records prevent live continuation without a
+   * compatible scoped registration; ignorable records carry `ignorable: true`.
+   */
+  'session-extension/event': SessionExtensionEventData
 }
 
 /** The appendable event-type keys of {@link SessionEventMap}, plugin-merged extensions included. */
@@ -390,6 +435,12 @@ export interface SurfaceIntent {
    * Other surface events require a non-empty set when this field is present.
    */
   sourceEventSeqs?: number[]
+}
+
+/** Optional envelope metadata for a log-only event. */
+export interface LogEventIntent {
+  /** Mark the record safe for a reader that does not recognize its event type. */
+  ignorable?: true
 }
 
 /**

@@ -9,16 +9,22 @@
 import { Context, Service } from '@deepseek-ai/cordis'
 import { isAbsolute } from 'node:path'
 import { deepFreeze } from '@deepseek-ai/dsh-llm'
-import { scopeOf, scopeTarget } from '@deepseek-ai/dsh-scope'
-import type { Scoped } from '@deepseek-ai/dsh-scope'
+import { scopeChainOf, scopeOf, scopeTarget } from '@deepseek-ai/dsh-scope'
+import type { ScopeKey, Scoped } from '@deepseek-ai/dsh-scope'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, SessionId } from './types.ts'
 import type { TypertLookup } from '@deepseek-ai/dsh-typert-protocol'
-import type { CreateSessionOptions, EpochHeader, PrepareSessionOptions, RequestContext, SessionEvent, SessionEventMap, SessionEventType, SessionHeader, SurfaceIntent, SurfaceEventType } from './types.ts'
+import type { CreateSessionOptions, EpochHeader, LogEventIntent, PrepareSessionOptions, RequestContext, SessionEvent, SessionEventMap, SessionEventType, SessionExtensionPayload, SessionExtensionType, SessionHeader, SurfaceIntent, SurfaceEventType } from './types.ts'
 import { snapshotJsonValue } from './json.ts'
-import { deriveEventMessage, SurfaceManager } from './surface.ts'
+import { deriveEventMessage, isSurfaceEligibleType, SurfaceManager } from './surface.ts'
 import type { SessionSurface } from './surface.ts'
 import { foldRequestHeader } from './request-header.ts'
+import {
+  SessionExtensionRegistry,
+  type SessionExtensionDescriptor,
+  type SessionExtensionRegistration,
+  type TypedSessionExtensionEvent,
+} from './extensions.ts'
 
 export * from './types.ts'
 export { SessionPreparation } from './preparation.ts'
@@ -33,6 +39,13 @@ export type { SessionSurface, SurfaceFoldReplacement, SurfaceFoldResult } from '
 export { deriveEventMessage, foldSurface, isAppendSurfaceEvent, isReplacementSurfaceEvent, isSurfaceEvent, isSurfaceEligibleType } from './surface.ts'
 export { canonicalHeader, foldRequestHeader, headerEquals } from './request-header.ts'
 export { KNOWN_SESSION_EVENT_TYPES } from './known-event-types.ts'
+export {
+  SessionExtensionCompatibilityError,
+  type SessionExtensionCompatibilityIssue,
+  type SessionExtensionDescriptor,
+  type SessionExtensionRegistration,
+  type TypedSessionExtensionEvent,
+} from './extensions.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -165,6 +178,10 @@ function snapshotSessionHeader(id: SessionId, source?: SessionHeader): SessionHe
  * @returns the same event object with a validated, deeply frozen message.
  */
 export function adoptSessionEvent<T extends SessionEvent>(event: T): T {
+  assertSessionExtensionEventShape(
+    event,
+    `session event at seq ${event.seq}`,
+  )
   assertMessageEventShape(
     event,
     `session event at seq ${event.seq}`,
@@ -239,6 +256,7 @@ function assertSessionEventEnvelope(value: Record<string, unknown>, index: numbe
     || (event['ignorable'] !== undefined && event['ignorable'] !== true)) {
     throw new Error(`seed event at index ${index} has an invalid event envelope`)
   }
+  assertSessionExtensionEventShape(event, `seed event at index ${index}`)
   switch (type) {
     case 'request/header':
     case 'user/message':
@@ -246,6 +264,44 @@ function assertSessionEventEnvelope(value: Record<string, unknown>, index: numbe
     case 'tool/result':
       assertCurrentLlmShape(event, index)
       break
+  }
+}
+
+/** Validate the core-owned carrier independently of any optional plugin. */
+function assertSessionExtensionEventShape(event: Record<string, unknown>, subject: string): void {
+  if (event['type'] !== 'session-extension/event') return
+  if (event['surfaceOp'] !== undefined || event['sourceEventSeqs'] !== undefined) {
+    throw new Error(`${subject} session-extension/event must be log-only`)
+  }
+  const data = event['data']
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error(`${subject} has invalid session-extension/event data`)
+  }
+  const record = data as Record<string, unknown>
+  const keys = Object.keys(record)
+  const expected = ['eventType', 'owner', 'payload', 'requirement', 'schemaVersion']
+  if (keys.length !== expected.length || expected.some(key => !Object.hasOwn(record, key))) {
+    throw new Error(`${subject} session-extension/event data must contain exact owner, eventType, schemaVersion, requirement, and payload fields`)
+  }
+  for (const field of ['owner', 'eventType'] as const) {
+    const value = record[field]
+    if (typeof value !== 'string' || value.length === 0 || value !== value.trim() || value.includes('\0')) {
+      throw new Error(`${subject} session-extension/event ${field} must be a non-empty trimmed string without NUL`)
+    }
+  }
+  const schemaVersion = record['schemaVersion']
+  if (typeof schemaVersion !== 'number' || !Number.isSafeInteger(schemaVersion) || schemaVersion < 1) {
+    throw new Error(`${subject} session-extension/event schemaVersion must be a positive safe integer`)
+  }
+  const requirement = record['requirement']
+  if (requirement !== 'required' && requirement !== 'ignorable') {
+    throw new Error(`${subject} session-extension/event requirement must be "required" or "ignorable"`)
+  }
+  if (requirement === 'required' && event['ignorable'] !== undefined) {
+    throw new Error(`${subject} required session-extension/event must not be marked ignorable`)
+  }
+  if (requirement === 'ignorable' && event['ignorable'] !== true) {
+    throw new Error(`${subject} ignorable session-extension/event must be marked ignorable`)
   }
 }
 
@@ -402,8 +458,10 @@ function invokeContainedSessionObservers(
 interface SessionEntry {
   readonly id: SessionId
   readonly session: Session
+  readonly scope: ScopeKey | undefined
   readonly carrier: Scoped<Session>
   readonly emitCtx: Context
+  readonly assertExtensions: () => void
   announced: boolean
   announcing: boolean
   appending: boolean
@@ -576,24 +634,20 @@ export class Session {
    *
    * @param type - The event type (key of {@link SessionEventMap}).
    * @param data - The event payload; must be JSON-serializable.
-   * @param opts - Surface metadata: `surfaceOp` controls how the event enters
-   *   the ordered surface; `sourceEventSeqs` lists the seq numbers of earlier
-   *   events this one derives from. REQUIRED for
-   *   {@link SurfaceEventType} events (every message-producing event must
-   *   declare how it joins the surface, the sole source of derived model
-   *   history) and
-   *   rejected by the compiler for non-surface types like `turn/start` or
-   *   `assistant/chunk`.
+   * @param opts - Event metadata. Surface events require `surfaceOp` and may
+   *   cite earlier `sourceEventSeqs`; log-only events may set only
+   *   `ignorable: true`. The compiler keeps the two forms disjoint.
    * @returns the logged event — its assigned `seq`/`time` plus the SNAPSHOT of
    *   `data` that entered the log, so reading `event.data` back sees the logged
    *   value, never the caller's still-mutable input.
    * @throws if `data` or surface metadata is not losslessly JSON-serializable
    *   (BigInt, function, symbol, undefined, negative zero, non-finite number,
    *   circular reference, sparse array, or an exotic object such as
-   *   Map/Set/Date/class instance), or when the candidate violates the
-   *   canonical surface contract (marker shape and eligibility, unique
-   *   earlier source-event references, positional replacement validity, and complete
-   *   shadowed-node coverage). One recursive pass reads, validates, and
+   *   Map/Set/Date/class instance), when a session-extension carrier is
+   *   malformed, when a new turn lacks a required scoped extension, or when
+   *   the candidate violates the canonical surface contract (marker shape and
+   *   eligibility, unique earlier source-event references, positional replacement
+   *   validity, and complete shadowed-node coverage). One recursive pass reads, validates, and
    *   copies each nested value once, so a stateful getter cannot supply one value
    *   to validation and another to storage. The event log is the durable source
    *   of truth, so a bad event fails at the append site rather than later during
@@ -604,12 +658,27 @@ export class Session {
   append<T extends SessionEventType>(
     type: T,
     data: SessionEventMap[T],
-    ...opts: T extends SurfaceEventType ? [opts: SurfaceIntent] : []
+    ...opts: T extends SurfaceEventType ? [opts: SurfaceIntent] : [opts?: LogEventIntent]
   ): SessionEvent<T> {
-    const surfaceOpts: SurfaceIntent | undefined = opts[0]
+    const intent: SurfaceIntent | LogEventIntent | undefined = opts[0]
+    const surfaceEligible = isSurfaceEligibleType(type)
+    const surfaceOpts = surfaceEligible ? intent as SurfaceIntent | undefined : undefined
+    const logIntent = surfaceEligible ? undefined : intent as LogEventIntent | undefined
+    if (surfaceEligible && (intent as LogEventIntent | undefined)?.ignorable === true) {
+      throw new Error(`surface session event "${type}" cannot be marked ignorable`)
+    }
+    if (!surfaceEligible && (intent as SurfaceIntent | undefined)?.surfaceOp !== undefined) {
+      throw new Error(`session event type "${type}" is not surface-eligible and cannot carry surfaceOp`)
+    }
+    if (!surfaceEligible && (intent as SurfaceIntent | undefined)?.sourceEventSeqs !== undefined) {
+      throw new Error(`session event type "${type}" is not surface-eligible and cannot carry sourceEventSeqs`)
+    }
+    const entry = attachments.get(this)
+    if (type === 'turn/start') entry?.assertExtensions()
     const surfaceMetadata = {
       ...surfaceOpts?.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: surfaceOpts.sourceEventSeqs },
       ...surfaceOpts?.surfaceOp === undefined ? {} : { surfaceOp: surfaceOpts.surfaceOp },
+      ...logIntent?.ignorable === true ? { ignorable: true as const } : {},
     }
     const dataSnapshot = snapshotJsonValue(data)
     if (dataSnapshot === undefined) {
@@ -620,7 +689,6 @@ export class Session {
     if (surfaceMetadataSnapshot === undefined) {
       throw new Error(`session event "${type}" carries non-JSON-serializable surface metadata`)
     }
-    const entry = attachments.get(this)
     if (entry?.appending) {
       throw new Error('session append cannot reenter while another append is being published')
     }
@@ -629,8 +697,12 @@ export class Session {
       seq: this.log.length,
       time: Date.now(),
       data: dataSnapshot,
-      ...(surfaceMetadataSnapshot as { surfaceOp?: unknown; sourceEventSeqs?: unknown }),
+      ...surfaceMetadataSnapshot,
     } as unknown as SessionEvent<T>)
+    assertSessionExtensionEventShape(
+      event,
+      `session event "${type}"`,
+    )
     this.surfaceManager.validateNext(event as SessionEvent)
 
     if (entry !== undefined) entry.appending = true
@@ -792,6 +864,14 @@ export class SessionForkError extends Error {
 export class SessionStore extends Service {
   private store = new Map<SessionId, SessionEntry>()
   private counter = 0
+  private readonly extensionRegistry = new SessionExtensionRegistry(
+    <K extends SessionExtensionType>(
+      session: Session,
+      descriptor: Readonly<SessionExtensionDescriptor<K>>,
+      payload: SessionExtensionPayload<K>,
+      registrationScope: ScopeKey | undefined,
+    ): TypedSessionExtensionEvent<K> => this.appendEventExtension(session, descriptor, payload, registrationScope),
+  )
 
   constructor(ctx: Context) {
     super(ctx, 'sessions')
@@ -804,6 +884,61 @@ export class SessionStore extends Service {
         resolve: sessionId => this.get(sessionId),
       })
     })
+  }
+
+  /**
+   * Register one out-of-repository event descriptor in the calling scope.
+   * The returned handle is invalidated on fiber unload and is the only typed
+   * append path that binds carrier metadata to the active registration.
+   * @param descriptor - durable owner, type, version, and continuation requirement.
+   * @returns the scoped registration and append capability.
+   */
+  registerEventExtension<K extends SessionExtensionType>(
+    descriptor: SessionExtensionDescriptor<K>,
+  ): SessionExtensionRegistration<K> {
+    return this.extensionRegistry.register(this.ctx, descriptor)
+  }
+
+  /**
+   * Check whether the calling scope can interpret every required carrier in a
+   * detached or live session. Read-only inspection never calls this method.
+   * @param session - session whose required carrier records are checked.
+   */
+  assertEventExtensionsCompatible(session: Session): void {
+    this.assertEventExtensionsCompatibleAt(session, scopeOf(this.ctx))
+  }
+
+  private assertEventExtensionsCompatibleAt(
+    session: Session,
+    scope: ScopeKey | undefined,
+  ): void {
+    this.extensionRegistry.assertCompatible(session.id, session.events, scope)
+  }
+
+  private appendEventExtension<K extends SessionExtensionType>(
+    session: Session,
+    descriptor: Readonly<SessionExtensionDescriptor<K>>,
+    payload: SessionExtensionPayload<K>,
+    registrationScope: ScopeKey | undefined,
+  ): TypedSessionExtensionEvent<K> {
+    const entry = this.liveEntryFor(session)
+    if (registrationScope !== undefined && !scopeChainOf(entry.scope).includes(registrationScope)) {
+      throw new Error(
+        `session extension "${descriptor.owner}/${descriptor.eventType}" registration scope does not own session "${session.id}"`,
+      )
+    }
+    if (!this.extensionRegistry.isVisible(entry.scope, descriptor)) {
+      throw new Error(
+        `session extension "${descriptor.owner}/${descriptor.eventType}" is not registered for session "${session.id}"`,
+      )
+    }
+    return session.append('session-extension/event', {
+      owner: descriptor.owner,
+      eventType: descriptor.eventType,
+      schemaVersion: descriptor.schemaVersion,
+      requirement: descriptor.requirement,
+      payload,
+    }, descriptor.requirement === 'ignorable' ? { ignorable: true } : {}) as unknown as TypedSessionExtensionEvent<K>
   }
 
   /**
@@ -912,16 +1047,20 @@ export class SessionStore extends Service {
    */
   enter(session: Session): () => void {
     const id = session.id
-    const carrier = scopeTarget(session, scopeOf(this.ctx))
+    const scope = scopeOf(this.ctx)
     // This is the authoritative collision boundary after arbitrary unpublished
     // preparation. Only one exact same-id transaction can publish.
     if (this.store.has(id)) throw new Error(`session "${id}" already exists`)
     if (attachments.has(session)) throw new Error(`session "${id}" is already attached to a store`)
+    this.assertEventExtensionsCompatibleAt(session, scope)
+    const carrier = scopeTarget(session, scope)
     const entry: SessionEntry = {
       id,
       session,
+      scope,
       carrier,
       emitCtx: this.ctx,
+      assertExtensions: () => { this.assertEventExtensionsCompatibleAt(session, scope) },
       announced: false,
       announcing: false,
       appending: false,
@@ -970,6 +1109,7 @@ export class SessionStore extends Service {
     if (entry.announced || entry.announcing) {
       throw new Error(`session "${entry.id}" was already announced`)
     }
+    entry.assertExtensions()
     // Mark before emit: Cordis emit may deliver to earlier listeners and then
     // throw. Rollback must still pair that partial creation with disposal, and
     // a listener cannot recursively create a second lifecycle edge.

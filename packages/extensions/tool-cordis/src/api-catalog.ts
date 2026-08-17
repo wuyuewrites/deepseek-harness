@@ -1459,6 +1459,17 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     description: 'In-memory session store (`ctx.sessions`).\n\nPersistence is intentionally not implemented here — persistence plugins subscribe to `session/event` and flush on `session/flush` / dispose.',
     methods: [
       {
+        signature: 'registerEventExtension<K extends SessionExtensionType>( descriptor: SessionExtensionDescriptor<K>, ): SessionExtensionRegistration<K>',
+        description: 'Register one out-of-repository event descriptor in the calling scope. The returned handle is invalidated on fiber unload and is the only typed append path that binds carrier metadata to the active registration.',
+        parameters: [{ name: 'descriptor', description: 'durable owner, type, version, and continuation requirement.' }],
+        returns: 'the scoped registration and append capability.',
+      },
+      {
+        signature: 'assertEventExtensionsCompatible(session: Session): void',
+        description: 'Check whether the calling scope can interpret every required carrier in a detached or live session. Read-only inspection never calls this method.',
+        parameters: [{ name: 'session', description: 'session whose required carrier records are checked.' }],
+      },
+      {
         signature: 'create(id?: SessionId, options?: CreateSessionOptions): Session',
         description: 'Create a session owned by the calling fiber: disposing that fiber stops event notification and removes the session from the store. `options.seed` populates the session with a copy of those events (replay/fork); `options.meta` attaches creation metadata (validated absolute `cwd`, seed and parent lineage, and delegation depth) as the immutable SessionHeader (the store fills `version`/`id`/`createdAt`).\n\nFor an agent whose session must be torn down IN ORDER with its loop (so the loop\'s final events are published before the store attachment ends), do NOT use this — fold the session lifecycle into the agent\'s own effect via prepare + enter + announce (see `dsh-agent-loop`\'s creation transaction).',
         parameters: [{ name: 'id', description: 'the session id; omitted, the store mints `session-<n>`.' }, { name: 'options', description: 'seed events and/or creation metadata for the header.' }],
@@ -4083,7 +4094,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'SessionEventMap',
-    declaration: 'export interface SessionEventMap {\n    \'turn/start\': {\n        turn: number;\n    };\n    \'turn/end\': {\n        turn: number;\n        reason: TurnEndReason;\n    };\n    \'step/start\': {\n        turn: number;\n        step: number;\n    };\n    \'step/end\': {\n        turn: number;\n        step: number;\n    };\n    \'user/message\': UserMessage;\n    \'assistant/chunk\': {\n        turn: number;\n        step: number;\n        chunk: StreamChunk;\n    };\n    \'assistant/message\': {\n        turn: number;\n        step: number;\n        message: AssistantMessage;\n        usage?: TokenUsage;\n        interrupted?: true;\n    };\n    \'tool/call\': {\n        turn: number;\n        step: number;\n        callId: CallId;\n        name: string;\n        arguments: string;\n    };\n    \'tool/result\': {\n        turn: number;\n        step: number;\n        message: ToolResultMessage;\n        error?: {\n            name: string;\n            code: string;\n        };\n        meta?: JsonValue;\n    };\n    \'todo/write\': {\n        todos: TodoItem[];\n    };\n    \'request/header\': {\n        header: EpochHeader;\n        reason: RequestHeaderReason;\n    };\n    \'request/context\': RequestContext;\n    \'session/end-seed\': Record<string, never>;\n}',
+    declaration: 'export interface SessionEventMap {\n    \'turn/start\': {\n        turn: number;\n    };\n    \'turn/end\': {\n        turn: number;\n        reason: TurnEndReason;\n    };\n    \'step/start\': {\n        turn: number;\n        step: number;\n    };\n    \'step/end\': {\n        turn: number;\n        step: number;\n    };\n    \'user/message\': UserMessage;\n    \'assistant/chunk\': {\n        turn: number;\n        step: number;\n        chunk: StreamChunk;\n    };\n    \'assistant/message\': {\n        turn: number;\n        step: number;\n        message: AssistantMessage;\n        usage?: TokenUsage;\n        interrupted?: true;\n    };\n    \'tool/call\': {\n        turn: number;\n        step: number;\n        callId: CallId;\n        name: string;\n        arguments: string;\n    };\n    \'tool/result\': {\n        turn: number;\n        step: number;\n        message: ToolResultMessage;\n        error?: {\n            name: string;\n            code: string;\n        };\n        meta?: JsonValue;\n    };\n    \'todo/write\': {\n        todos: TodoItem[];\n    };\n    \'request/header\': {\n        header: EpochHeader;\n        reason: RequestHeaderReason;\n    };\n    \'request/context\': RequestContext;\n    \'session/end-seed\': Record<string, never>;\n    \'session-extension/event\': SessionExtensionEventData;\n}',
   },
   {
     name: 'SessionEventMetadataFilter',
@@ -4140,6 +4151,34 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'SessionEventWindow',
     declaration: 'export interface SessionEventWindow {\n    session: SessionHeader;\n    target: SessionEvent;\n    events: SessionEvent[];\n    startSeq: number;\n    endSeq: number;\n}',
+  },
+  {
+    name: 'SessionExtensionDescriptor',
+    declaration: 'export interface SessionExtensionDescriptor<K extends SessionExtensionType = SessionExtensionType> {\n    readonly owner: string;\n    readonly eventType: K;\n    readonly schemaVersion: number;\n    readonly requirement: SessionExtensionRequirement;\n}',
+  },
+  {
+    name: 'SessionExtensionEventData',
+    declaration: 'export interface SessionExtensionEventData {\n    owner: string;\n    eventType: string;\n    schemaVersion: number;\n    requirement: SessionExtensionRequirement;\n    payload: JsonValue;\n}',
+  },
+  {
+    name: 'SessionExtensionMap',
+    declaration: 'export interface SessionExtensionMap {\n}',
+  },
+  {
+    name: 'SessionExtensionPayload',
+    declaration: 'export type SessionExtensionPayload<K extends SessionExtensionType> = K extends keyof SessionExtensionMap ? SessionExtensionMap[K] : JsonValue;',
+  },
+  {
+    name: 'SessionExtensionRegistration',
+    declaration: 'export interface SessionExtensionRegistration<K extends SessionExtensionType> {\n    readonly descriptor: Readonly<SessionExtensionDescriptor<K>>;\n    append(session: Session, payload: SessionExtensionPayload<K>): TypedSessionExtensionEvent<K>;\n    matches(event: SessionEvent): boolean;\n    dispose(): void;\n}',
+  },
+  {
+    name: 'SessionExtensionRequirement',
+    declaration: 'export type SessionExtensionRequirement = \'required\' | \'ignorable\';',
+  },
+  {
+    name: 'SessionExtensionType',
+    declaration: 'export type SessionExtensionType = [\n    DeclaredSessionExtensionType\n] extends [\n    never\n] ? string : DeclaredSessionExtensionType;',
   },
   {
     name: 'SessionForkSource',
@@ -4864,6 +4903,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'TurnEndReasonMap',
     declaration: 'export interface TurnEndReasonMap {\n    completed: {\n        kind: \'completed\';\n    };\n    aborted: {\n        kind: \'aborted\';\n        reason: TurnEndCancelCause;\n    };\n    blocked: {\n        kind: \'blocked\';\n    };\n    error: {\n        kind: \'error\';\n        error: LlmFailure;\n    };\n    \'max-tokens\': {\n        kind: \'max-tokens\';\n    };\n    interrupted: {\n        kind: \'interrupted\';\n    };\n}',
+  },
+  {
+    name: 'TypedSessionExtensionEvent',
+    declaration: 'export type TypedSessionExtensionEvent<K extends SessionExtensionType> = Omit<SessionEvent<\'session-extension/event\'>, \'data\'> & {\n    readonly data: Omit<SessionEvent<\'session-extension/event\'>[\'data\'], \'payload\'> & {\n        readonly payload: SessionExtensionPayload<K>;\n    };\n};',
   },
   {
     name: 'TypertCodec',

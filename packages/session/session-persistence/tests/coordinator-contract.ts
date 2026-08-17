@@ -45,6 +45,26 @@ function send(session: Session, events: readonly SessionEvent[]): void {
   appendLog(session, events)
 }
 
+/** One self-describing out-of-repository carrier at a caller-supplied seq. */
+function extensionEvent(
+  requirement: 'required' | 'ignorable',
+  seq: number,
+): SessionEvent<'session-extension/event'> {
+  return {
+    type: 'session-extension/event',
+    seq,
+    time: 99,
+    data: {
+      owner: '@test/session-extension',
+      eventType: 'test/state',
+      schemaVersion: 1,
+      requirement,
+      payload: { value: requirement },
+    },
+    ...requirement === 'ignorable' ? { ignorable: true as const } : {},
+  }
+}
+
 /** A valid persisted log from immediately before messages gained wrappers and identities. */
 function legacyMessageLog(): SessionEvent[] {
   return [
@@ -1379,6 +1399,58 @@ export function runCoordinatorContract(name: string, makeFixture: () => Promise<
         ])
         const loaded = await ctx.sessionPersistence.load(skippable.id)
         expect(loaded.events.some(event => (event.type as string) === 'future/event')).toBe(true)
+      } finally {
+        await fiber.dispose()
+        await fix.cleanup()
+      }
+    })
+
+    it('round-trips self-describing extension carriers without the owner plugin', async () => {
+      const fix = await makeFixture()
+      const { ctx, fiber } = await freshCtx(fix)
+      try {
+        for (const requirement of ['required', 'ignorable'] as const) {
+          const id = SessionId(`extension-${requirement}`)
+          const base = oneTurnLog()
+          const carrier = extensionEvent(requirement, base.length)
+          await ctx.sessionPersistence.create(meta(id, WORK))
+          await ctx.sessionPersistence.append(id, [...base, carrier])
+
+          await expect(ctx.sessionPersistence.inspect(id))
+            .resolves.toMatchObject({ events: [...base, carrier] })
+          await expect(ctx.sessionPersistence.load(id))
+            .resolves.toMatchObject({ events: [...base, carrier] })
+          await expect(ctx.sessionPersistence.readFrom(id, carrier.seq))
+            .resolves.toMatchObject({ events: [carrier] })
+          const preparation = await ctx.sessionPersistence.prepare(id)
+          expect(preparation.session.events).toMatchObject([...base, carrier, {
+            type: 'session/end-seed',
+          }])
+          preparation[Symbol.dispose]()
+        }
+      } finally {
+        await fiber.dispose()
+        await fix.cleanup()
+      }
+    })
+
+    it('rejects malformed extension carriers as invalid persisted data', async () => {
+      const fix = await makeFixture()
+      const { ctx, fiber } = await freshCtx(fix)
+      try {
+        const id = SessionId('extension-malformed')
+        const base = oneTurnLog()
+        const malformed = {
+          ...extensionEvent('required', base.length),
+          ignorable: true,
+        } as SessionEvent<'session-extension/event'>
+        await ctx.sessionPersistence.create(meta(id, WORK))
+        await ctx.sessionPersistence.append(id, [...base, malformed])
+
+        await expect(ctx.sessionPersistence.inspect(id))
+          .rejects.toThrow(/required session-extension\/event must not be marked ignorable/)
+        await expect(ctx.sessionPersistence.readFrom(id, malformed.seq))
+          .rejects.toThrow(/required session-extension\/event must not be marked ignorable/)
       } finally {
         await fiber.dispose()
         await fix.cleanup()

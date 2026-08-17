@@ -5,8 +5,8 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
-import SessionStore, { SESSION_FORMAT_VERSION, Session, SessionId, SessionPreparation } from '@deepseek-ai/dsh-session'
-import type { SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
+import SessionStore, { SESSION_FORMAT_VERSION, Session, SessionExtensionCompatibilityError, SessionId, SessionPreparation } from '@deepseek-ai/dsh-session'
+import type { SessionEvent, SessionExtensionDescriptor, SessionHeader } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
@@ -14,6 +14,19 @@ import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { MockAdapter, textResponse } from './mock-adapter.ts'
+
+declare module '@deepseek-ai/dsh-session/types' {
+  interface SessionExtensionMap {
+    'test/resume-state': { value: string }
+  }
+}
+
+const REQUIRED_EXTENSION = {
+  owner: '@test/resume',
+  eventType: 'test/resume-state',
+  schemaVersion: 1,
+  requirement: 'required',
+} as const satisfies SessionExtensionDescriptor<'test/resume-state'>
 
 const dirs: string[] = []
 afterEach(async () => { for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true }) })
@@ -89,6 +102,39 @@ function throwUnknown(value: unknown): never {
 }
 
 describe('the session-persistence Agent Note: AgentLoop factory create/resume', () => {
+  it('inspects a required extension without its plugin and admits resume after scoped setup registers it', async () => {
+    const sessionId = SessionId('extension-resume')
+    const first = await persistentHarness(new MockAdapter([]))
+    const registration = first.ctx.sessions.registerEventExtension(REQUIRED_EXTENSION)
+    const session = first.ctx.sessions.create(sessionId, { seed: [
+      { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
+      { type: 'turn/end', seq: 1, time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
+    ] })
+    registration.append(session, { value: 'persisted' })
+    await first.ctx.sessions.flush(session)
+    await first.ctx.fiber.dispose()
+
+    const ctx = await mountPersistentHarness(first.root, new MockAdapter([]))
+    const inspection = await ctx.sessionPersistence.inspect(sessionId)
+    const carrier = inspection.events.find(event => event.type === 'session-extension/event')
+    expect(carrier?.type).toBe('session-extension/event')
+    if (carrier?.type !== 'session-extension/event') throw new Error('missing required extension carrier')
+    expect(carrier.data.eventType).toBe('test/resume-state')
+    await expect(ctx.agents.resume({ resumeSessionId: sessionId }))
+      .rejects.toBeInstanceOf(SessionExtensionCompatibilityError)
+    expect(ctx.sessions.get(sessionId)).toBeUndefined()
+
+    const handle = await ctx.agents.resume({
+      resumeSessionId: sessionId,
+      setup: (agentCtx) => {
+        agentCtx.sessions.registerEventExtension(REQUIRED_EXTENSION)
+      },
+    })
+    expect(handle.agent.session.events.some(event => event.type === 'session-extension/event')).toBe(true)
+    await handle.dispose()
+    await ctx.fiber.dispose()
+  })
+
   it('resumes a pre-react-loop session including pre-identity message events', async () => {
     const sessionId = SessionId('pre-identity-resume')
     const first = await persistentHarness(new MockAdapter([]))

@@ -125,10 +125,23 @@ interface SessionEventMap {
    * so tolerating concurrent writers needs a signal beyond the log.
    */
   'session/end-seed': Record<string, never>
+  /**
+   * Log-only carrier for events owned by out-of-repository plugins. Every
+   * record is self-describing so suffix reads never depend on an earlier
+   * declaration. Required records prevent live continuation without a
+   * compatible scoped registration; ignorable records carry `ignorable: true`.
+   */
+  'session-extension/event': SessionExtensionEventData
 }
 ```
 
 `UserMessage` is the identified, frozen user-role value shared by ordinary prompts, injected context, steering, and live inbox events. Event wrappers add only event-local position or outcome facts; the loop adds only driver-owned routing state while an item remains pending.
+
+### Out-of-repository events
+
+An out-of-repository plugin declaration-merges its payload into `SessionExtensionMap`, then calls `ctx.sessions.registerEventExtension()` with a stable owner, event type, positive schema version, and `required` or `ignorable` continuation requirement. Its handle writes a log-only, self-describing `session-extension/event` carrier; internal event names never join `KNOWN_SESSION_EVENT_TYPES`.
+
+Persistence inspection, loading, suffix reads, and detached preparation preserve carriers without consulting the current plugin composition. A required carrier needs an exact registration in the session's captured scope before `enter`, `announce`, fork publication, or a new `turn/start`; an ignorable carrier does not. This keeps valid logs inspectable when a plugin is absent while preventing a live agent from silently discarding required state.
 
 ### `TodoItem` — one todo-list entry
 
@@ -448,24 +461,20 @@ declare class Session {
    *
    * @param type - The event type (key of {@link SessionEventMap}).
    * @param data - The event payload; must be JSON-serializable.
-   * @param opts - Surface metadata: `surfaceOp` controls how the event enters
-   *   the ordered surface; `sourceEventSeqs` lists the seq numbers of earlier
-   *   events this one derives from. REQUIRED for
-   *   {@link SurfaceEventType} events (every message-producing event must
-   *   declare how it joins the surface, the sole source of derived model
-   *   history) and
-   *   rejected by the compiler for non-surface types like `turn/start` or
-   *   `assistant/chunk`.
+   * @param opts - Event metadata. Surface events require `surfaceOp` and may
+   *   cite earlier `sourceEventSeqs`; log-only events may set only
+   *   `ignorable: true`. The compiler keeps the two forms disjoint.
    * @returns the logged event — its assigned `seq`/`time` plus the SNAPSHOT of
    *   `data` that entered the log, so reading `event.data` back sees the logged
    *   value, never the caller's still-mutable input.
    * @throws if `data` or surface metadata is not losslessly JSON-serializable
    *   (BigInt, function, symbol, undefined, negative zero, non-finite number,
    *   circular reference, sparse array, or an exotic object such as
-   *   Map/Set/Date/class instance), or when the candidate violates the
-   *   canonical surface contract (marker shape and eligibility, unique
-   *   earlier source-event references, positional replacement validity, and complete
-   *   shadowed-node coverage). One recursive pass reads, validates, and
+   *   Map/Set/Date/class instance), when a session-extension carrier is
+   *   malformed, when a new turn lacks a required scoped extension, or when
+   *   the candidate violates the canonical surface contract (marker shape and
+   *   eligibility, unique earlier source-event references, positional replacement
+   *   validity, and complete shadowed-node coverage). One recursive pass reads, validates, and
    *   copies each nested value once, so a stateful getter cannot supply one value
    *   to validation and another to storage. The event log is the durable source
    *   of truth, so a bad event fails at the append site rather than later during
@@ -476,7 +485,7 @@ declare class Session {
   append<T extends SessionEventType>(
     type: T,
     data: SessionEventMap[T],
-    ...opts: T extends SurfaceEventType ? [opts: SurfaceIntent] : []
+    ...opts: T extends SurfaceEventType ? [opts: SurfaceIntent] : [opts?: LogEventIntent]
   ): SessionEvent<T>;
   /**
    * The {@link EpochHeader} in force after the log's last header event — the
@@ -625,6 +634,22 @@ In-memory session store (`ctx.sessions`).
 Persistence is intentionally not implemented here — persistence plugins subscribe to `session/event` and flush on `session/flush` / dispose.
 
 ```ts cordis-catalog
+/**
+ * Register one out-of-repository event descriptor in the calling scope.
+ * The returned handle is invalidated on fiber unload and is the only typed
+ * append path that binds carrier metadata to the active registration.
+ * @param descriptor - durable owner, type, version, and continuation requirement.
+ * @returns the scoped registration and append capability.
+ */
+registerEventExtension<K extends SessionExtensionType>( descriptor: SessionExtensionDescriptor<K>, ): SessionExtensionRegistration<K>
+
+/**
+ * Check whether the calling scope can interpret every required carrier in a
+ * detached or live session. Read-only inspection never calls this method.
+ * @param session - session whose required carrier records are checked.
+ */
+assertEventExtensionsCompatible(session: Session): void
+
 /**
  * Create a session owned by the calling fiber: disposing that fiber stops
  * event notification and removes the session from the store. `options.seed`

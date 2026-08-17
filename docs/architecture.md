@@ -122,7 +122,7 @@ New behavior attaches to a documented extension point. Changing the loop itself 
 | Add model-facing context | call `agent.inject()`; it lands in the next admitted request |
 | Add UI or editor integration | drive `ctx.agents` and render from `session/event` |
 | Add a Web Client Chat node | register a `ConversationNodeDefinition` + keyed renderer |
-| Add durable session state | extend `SessionEventMap`; render and replay from the log |
+| Add durable session state | in-repo packages extend `SessionEventMap`; out-of-repository plugins register a `SessionExtensionMap` carrier through `ctx.sessions.registerEventExtension()`; render and replay from the log |
 | Generate session titles | register the sole `ctx.sessionTitle` provider |
 | Manage a same-session objective | use `ctx.goals`; continue through `agent/*` |
 | Fork a live session | `ctx.sessions.fork(source, boundary?, childSessionId?)` |
