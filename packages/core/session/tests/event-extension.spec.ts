@@ -296,6 +296,29 @@ describe('session extension publication compatibility', () => {
     expect(ctx.sessions.get(SessionId('announce-race'))).toBeUndefined()
   })
 
+  it('checks a live session through its captured owner scope, not the caller scope', async () => {
+    const ctx = await mount()
+    const owner = await mintScope(ctx, 'owner-captured-live-check')
+    const other = await mintScope(ctx, 'other-live-check')
+    const registration = owner.ctx.sessions.registerEventExtension(REQUIRED)
+    const session = owner.ctx.sessions.create(SessionId('owner-captured-live-check'))
+    registration.append(session, { value: 'required' })
+
+    // The global store context cannot see the owner registration. The live
+    // check must still admit because entry ownership was captured at enter().
+    expect(() => { ctx.sessions.assertLiveEventExtensionsCompatible(session) }).not.toThrow()
+
+    registration.dispose()
+    other.ctx.sessions.registerEventExtension(REQUIRED)
+    expect(() => { ctx.sessions.assertLiveEventExtensionsCompatible(session) })
+      .toThrow(SessionExtensionCompatibilityError)
+
+    owner.ctx.sessions.registerEventExtension(REQUIRED)
+    expect(() => { ctx.sessions.assertLiveEventExtensionsCompatible(session) }).not.toThrow()
+    await other.dispose()
+    await owner.dispose()
+  })
+
   it('lets an open turn close after unload but blocks the next turn until registration returns', async () => {
     const ctx = await mount()
     const owner = await mintScope(ctx, 'owner')

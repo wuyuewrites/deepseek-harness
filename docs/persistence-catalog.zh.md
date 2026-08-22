@@ -157,12 +157,14 @@ export type SessionEvent<T extends SessionEventType = SessionEventType> = {
   toolName: string
   callId?: CallId
   reason?: string
+  /** Required host-attested actor kind; absent preserves ordinary approval semantics. */
+  requiredActor?: RequiredInteractionActor
 }
 ```
 
 类型：[CallId](subsystems/core.zh.md)
 
-来源：[`packages/interaction/user-approval/src/index.ts:44`](../packages/interaction/user-approval/src/index.ts)
+来源：[`packages/interaction/user-approval/src/index.ts:45`](../packages/interaction/user-approval/src/index.ts)
 
 <a id="approvaldecided--log-only"></a>
 
@@ -177,10 +179,12 @@ export type SessionEvent<T extends SessionEventType = SessionEventType> = {
 'approval/decided': {
   id: ApprovalRequestId
   outcome: ApprovalOutcome
+  /** Host-minted answer provenance; absent identifies a legacy/unattributed outcome. */
+  decidedBy?: InteractionActor
 }
 ```
 
-来源：[`packages/interaction/user-approval/src/index.ts:55`](../packages/interaction/user-approval/src/index.ts)
+来源：[`packages/interaction/user-approval/src/index.ts:58`](../packages/interaction/user-approval/src/index.ts)
 
 <a id="approvalpolicy--log-only"></a>
 
@@ -202,7 +206,7 @@ export type SessionEvent<T extends SessionEventType = SessionEventType> = {
 }
 ```
 
-来源：[`packages/interaction/user-approval/src/index.ts:67`](../packages/interaction/user-approval/src/index.ts)
+来源：[`packages/interaction/user-approval/src/index.ts:72`](../packages/interaction/user-approval/src/index.ts)
 
 ### `assistant/*`
 
@@ -262,7 +266,7 @@ export type SessionEvent<T extends SessionEventType = SessionEventType> = {
 }
 ```
 
-来源：[`packages/interaction/commands/src/types.ts:103`](../packages/interaction/commands/src/types.ts)
+来源：[`packages/interaction/commands/src/types.ts:129`](../packages/interaction/commands/src/types.ts)
 
 <a id="commandrun--log-only"></a>
 
@@ -282,7 +286,7 @@ export type SessionEvent<T extends SessionEventType = SessionEventType> = {
 'command/run': { commandId: CommandId; name: string; args?: string; source: CommandSource }
 ```
 
-来源：[`packages/interaction/commands/src/types.ts:96`](../packages/interaction/commands/src/types.ts)
+来源：[`packages/interaction/commands/src/types.ts:122`](../packages/interaction/commands/src/types.ts)
 
 ### `compaction/*`
 

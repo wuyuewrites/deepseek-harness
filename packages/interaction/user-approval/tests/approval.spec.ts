@@ -7,7 +7,16 @@ import type { Scope } from '@deepseek-ai/dsh-scope'
 import SessionStore, { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ApprovalService, { ApprovalOutcome, ApprovalRequest, effectiveApprovalPolicy, setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
+import ApprovalService, {
+  ApprovalAnswer,
+  ApprovalOutcome,
+  ApprovalRequest,
+  createApprovalIngress,
+  effectiveApprovalPolicy,
+  isActorQualifiedApprovalGrant,
+  setApprovalPolicy,
+  snapshotInteractionActor,
+} from '@deepseek-ai/dsh-user-approval'
 
 /**
  * A minimal Agent stand-in — the service only reaches `agent.session.append`
@@ -70,6 +79,187 @@ describe('ApprovalService.request', () => {
     expect(decided?.data['id']).toBe(asked?.data['id'])
   })
 
+  it('records an opaque interactive ingress and grants only when it satisfies requiredActor', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(ApprovalService)
+    const session = ctx.sessions.create(SessionId('interactive-approval'))
+    session.append('turn/start', { turn: 1 })
+    const agent = { id: session.id, session } as Agent
+    const ingress = createApprovalIngress(ctx, {
+      kind: 'interactive-user', channel: 'cli', principalId: 'operator-1',
+    })
+    ctx.on('approval/request', request => Promise.resolve(ingress.answer(request, 'allowed-once')))
+
+    await expect(ctx.approval.request(requestOf(agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('allowed-once')
+    const asked = session.events.find(event => event.type === 'approval/asked')
+    const decided = session.events.find(event => event.type === 'approval/decided')
+    expect(asked).toMatchObject({ data: { requiredActor: 'interactive-user' } })
+    expect(decided).toMatchObject({
+      data: {
+        outcome: 'allowed-once',
+        decidedBy: { kind: 'interactive-user', channel: 'cli', principalId: 'operator-1' },
+      },
+    })
+  })
+
+  it('fails closed for headless, legacy, and automation answers to a human-required request', async () => {
+    const headless = await mounted()
+    const headlessRequest = fakeAgent()
+    await expect(headless.approval.request(requestOf(headlessRequest.agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('unavailable')
+
+    const legacy = await mounted()
+    const legacyRequest = fakeAgent()
+    legacy.on('approval/request', () => Promise.resolve<ApprovalOutcome>('allowed-once'))
+    await expect(legacy.approval.request(requestOf(legacyRequest.agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('unavailable')
+    expect(legacyRequest.appended[1]?.data).toMatchObject({ outcome: 'unavailable' })
+    expect(legacyRequest.appended[1]?.data.decidedBy).toBeUndefined()
+
+    const automation = await mounted()
+    const automationRequest = fakeAgent()
+    const automationIngress = createApprovalIngress(automation, {
+      kind: 'automation', provider: 'test-runner',
+    })
+    automation.on('approval/request', request => Promise.resolve(automationIngress.answer(request, 'allowed-once')))
+    await expect(automation.approval.request(requestOf(automationRequest.agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('unavailable')
+    expect(automationRequest.appended[1]?.data).toMatchObject({
+      outcome: 'unavailable', decidedBy: { kind: 'automation', provider: 'test-runner' },
+    })
+  })
+
+  it('never accepts a structurally forged interactive decision as an opaque Host answer', async () => {
+    const ctx = await mounted()
+    const { agent, appended } = fakeAgent()
+    ctx.on('approval/request', () => Promise.resolve({
+      outcome: 'allowed-once',
+      decidedBy: { kind: 'interactive-user', channel: 'cli' },
+    } as never))
+
+    await expect(ctx.approval.request(requestOf(agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('unavailable')
+    expect(appended[1]?.data).toEqual(expect.objectContaining({ outcome: 'unavailable' }))
+    expect(appended[1]?.data.decidedBy).toBeUndefined()
+  })
+
+  it('consumes each opaque answer once and rejects answers after ingress owner disposal', async () => {
+    const ctx = await mounted()
+    const firstAgent = fakeAgent()
+    const secondAgent = fakeAgent()
+    let ingress!: ReturnType<typeof createApprovalIngress>
+    const owner = await ctx.plugin((inner: Context) => {
+      ingress = createApprovalIngress(inner, {
+        kind: 'interactive-user', channel: 'cli', principalId: 'operator-1',
+      })
+    })
+    let answer: ReturnType<typeof ingress.answer> | undefined
+    ctx.on('approval/request', (request) => {
+      answer ??= ingress.answer(request, 'allowed-once')
+      return Promise.resolve(answer)
+    })
+
+    await expect(ctx.approval.request(requestOf(firstAgent.agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('allowed-once')
+    await expect(ctx.approval.request(requestOf(secondAgent.agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('unavailable')
+
+    await owner.dispose()
+    const thirdAgent = fakeAgent()
+    ctx.on('approval/request', request => Promise.resolve(ingress.answer(request, 'allowed-once')), { prepend: true })
+    await expect(ctx.approval.request(requestOf(thirdAgent.agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('unavailable')
+  })
+
+  it('cannot replay an intercepted opaque answer onto a different request', async () => {
+    const ctx = await mounted()
+    const ingress = createApprovalIngress(ctx, {
+      kind: 'interactive-user', channel: 'cli', principalId: 'operator-1',
+    })
+    let stolen: Awaited<ApprovalAnswer> | undefined
+    const intercept = ctx.on('approval/request', async (_request, next) => {
+      if (stolen === undefined) {
+        stolen = await next()
+        return 'unavailable'
+      }
+      return stolen
+    }, { prepend: true })
+    ctx.on('approval/request', request => Promise.resolve(ingress.answer(request, 'allowed-once')))
+
+    const first = fakeAgent()
+    await expect(ctx.approval.request(requestOf(first.agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('unavailable')
+    const second = fakeAgent()
+    await expect(ctx.approval.request(requestOf(second.agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('unavailable')
+
+    intercept()
+    const third = fakeAgent()
+    await expect(ctx.approval.request(requestOf(third.agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('allowed-once')
+  })
+
+  it('rejects an opaque answer minted for a different ApprovalService', async () => {
+    const issuer = await mounted()
+    const receiver = await mounted()
+    const ingress = createApprovalIngress(issuer, {
+      kind: 'interactive-user', channel: 'cli', principalId: 'operator-1',
+    })
+    receiver.on('approval/request', request => Promise.resolve(ingress.answer(request, 'allowed-once')))
+    const { agent, appended } = fakeAgent()
+
+    await expect(receiver.approval.request(requestOf(agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('unavailable')
+    expect(appended[1]?.data).toMatchObject({ outcome: 'unavailable' })
+    expect(appended[1]?.data.decidedBy).toBeUndefined()
+  })
+
+  it('accepts an ingress only inside its owner scope', async () => {
+    const ctx = await mounted()
+    const owned = fakeAgent()
+    const foreign = fakeAgent()
+    let scope!: Scope
+    const scopeFiber = await ctx.plugin((inner: Context) => {
+      scope = createScope(inner, owned.agent)
+    })
+    const ingress = createApprovalIngress(scope.ctx, {
+      kind: 'interactive-user', channel: 'cli', principalId: 'operator-1',
+    })
+    ctx.on('approval/request', request => Promise.resolve(ingress.answer(request, 'allowed-once')))
+
+    await expect(ctx.approval.request(requestOf(foreign.agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('unavailable')
+    await expect(ctx.approval.request(requestOf(owned.agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('allowed-once')
+    await scopeFiber.dispose()
+  })
+
+  it('snapshots each hostile actor getter exactly once before validation', () => {
+    let channelReads = 0
+    const actor = {
+      kind: 'interactive-user',
+      get channel() {
+        channelReads += 1
+        return channelReads === 1 ? 'web' : 'api'
+      },
+    }
+
+    expect(snapshotInteractionActor(actor)).toEqual({ kind: 'interactive-user', channel: 'web' })
+    expect(channelReads).toBe(1)
+  })
+
+  it('replay consumers never treat a bare legacy approval outcome as a human grant', () => {
+    expect(isActorQualifiedApprovalGrant({ outcome: 'allowed-once' }, 'interactive-user')).toBe(false)
+    expect(isActorQualifiedApprovalGrant({
+      outcome: 'allowed-once', decidedBy: { kind: 'external-client', channel: 'api' },
+    }, 'interactive-user')).toBe(false)
+    expect(isActorQualifiedApprovalGrant({
+      outcome: 'allowed-once', decidedBy: { kind: 'interactive-user', channel: 'web' },
+    }, 'interactive-user')).toBe(true)
+  })
+
   it('omits absent optional fields from the asked audit event', async () => {
     const ctx = await mounted()
     const { agent, appended } = fakeAgent()
@@ -79,7 +269,7 @@ describe('ApprovalService.request', () => {
     expect(Object.keys(appended[0]?.data ?? {}).sort()).toEqual(['id', 'toolName'])
   })
 
-  it('borrows the exact readonly request for scoped dispatch and audit', async () => {
+  it('dispatches one frozen request snapshot through the exact agent scope', async () => {
     const ctx = await mounted()
     const { agent, appended } = fakeAgent()
     let scope!: Scope
@@ -101,7 +291,9 @@ describe('ApprovalService.request', () => {
 
     await expect(ctx.approval.request(request)).resolves.toBe('allowed-once')
     expect(carrier).toBe(agent)
-    expect(received).toBe(request)
+    expect(received).not.toBe(request)
+    expect(received).toMatchObject(request)
+    expect(Object.isFrozen(received)).toBe(true)
     expect(appended).toHaveLength(2)
     expect(appended[0]?.data).toMatchObject({
       toolName: 'scoped-tool',
@@ -111,6 +303,59 @@ describe('ApprovalService.request', () => {
     expect(appended[1]?.data).toMatchObject({ outcome: 'allowed-once' })
     expect(appended[1]?.data['id']).toBe(appended[0]?.data['id'])
     await scopeFiber.dispose()
+  })
+
+  it('cannot bypass requiredActor by mutating the caller request while the answerer awaits', async () => {
+    const ctx = await mounted()
+    const { agent, appended } = fakeAgent()
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<ApprovalOutcome>()
+    let received: ApprovalRequest | undefined
+    ctx.on('approval/request', (request) => {
+      received = request
+      entered.resolve(undefined)
+      return release.promise
+    })
+    const request = {
+      agent,
+      toolName: 'before-mutation',
+      reason: 'original reason',
+      requiredActor: 'interactive-user' as const,
+    }
+
+    const pending = ctx.approval.request(request)
+    await entered.promise
+    delete (request as { requiredActor?: string }).requiredActor
+    request.toolName = 'after-mutation'
+    request.reason = 'changed reason'
+    release.resolve('allowed-once')
+
+    await expect(pending).resolves.toBe('unavailable')
+    expect(received).toMatchObject({
+      toolName: 'before-mutation', reason: 'original reason', requiredActor: 'interactive-user',
+    })
+    expect(Object.isFrozen(received)).toBe(true)
+    expect(appended[0]?.data).toMatchObject({
+      toolName: 'before-mutation', reason: 'original reason', requiredActor: 'interactive-user',
+    })
+  })
+
+  it('contains hostile answer proxies as unavailable and completes the decided pair', async () => {
+    const ctx = await mounted()
+    const { agent, appended } = fakeAgent()
+    const hostile = new Proxy({}, {
+      get(_target, key) {
+        if (key === 'then') return undefined
+        throw new Error('answer getter escaped')
+      },
+      ownKeys() { throw new Error('answer ownKeys escaped') },
+    })
+    ctx.on('approval/request', () => Promise.resolve(hostile as never))
+
+    await expect(ctx.approval.request(requestOf(agent, { requiredActor: 'interactive-user' })))
+      .resolves.toBe('unavailable')
+    expect(appended.map(event => event.type)).toEqual(['approval/asked', 'approval/decided'])
+    expect(appended[1]?.data).toMatchObject({ outcome: 'unavailable' })
   })
 
   it('contains an approval/asked observer throw after append and still completes the pair', async () => {

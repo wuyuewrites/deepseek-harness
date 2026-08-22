@@ -99,6 +99,43 @@ export function runPersistenceContract(name: string, make: () => Promise<Contrac
       }
     })
 
+    it('round-trips actor-qualified approval audit fields through load, inspect, and suffix reads', async () => {
+      const { persistence, dispose } = await make()
+      try {
+        const m = meta('approval-actor-roundtrip')
+        const events = [
+          { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
+          {
+            type: 'approval/asked', seq: 1, time: 2,
+            data: {
+              id: 'approval-actor-1',
+              toolName: 'human-control',
+              requiredActor: 'interactive-user',
+            },
+          },
+          {
+            type: 'approval/decided', seq: 2, time: 3,
+            data: {
+              id: 'approval-actor-1',
+              outcome: 'allowed-once',
+              decidedBy: {
+                kind: 'interactive-user', channel: 'cli', principalId: 'operator-1',
+              },
+            },
+          },
+          { type: 'turn/end', seq: 3, time: 4, data: { turn: 1, reason: { kind: 'completed' } } },
+        ] as unknown as SessionEvent[]
+        await persistence.create(m)
+        await persistence.append(m.id, events)
+
+        expect((await persistence.load(m.id)).events).toEqual(events)
+        expect((await persistence.inspect(m.id)).events).toEqual(events)
+        expect((await persistence.readFrom(m.id, 1)).events).toEqual(events.slice(1))
+      } finally {
+        await dispose()
+      }
+    })
+
     it('rejects a fractional creation timestamp without reserving its session id', async () => {
       const { persistence, dispose } = await make()
       try {

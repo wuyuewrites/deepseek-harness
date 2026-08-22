@@ -19,6 +19,7 @@ import { scopeOf } from '@deepseek-ai/dsh-scope'
 import { assertSupportedJsonSchema, defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import { Session } from '@deepseek-ai/dsh-session'
 import type { JsonValue } from '@deepseek-ai/dsh-session'
 
 const DYNAMIC_TOOL = Symbol('cordis-host-runner.dynamic-tool')
@@ -36,6 +37,149 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
     || typeof prototype === 'object'
       && Object.getPrototypeOf(prototype) === null
       && hasIntrinsicConstructor(prototype, 'Object')
+}
+
+const AGENT_MUTATORS = new Set(['cancel', 'followup', 'inject', 'runMaintenance', 'send', 'steer'])
+const SESSION_READ_FIELDS = new Set(['events', 'header', 'id', 'seq'])
+const SESSION_READ_METHODS = new Set(['deriveEventMessage', 'deriveMessages', 'requestContext', 'requestHeader'])
+const AGENT_READ_FIELDS = new Set(['id', 'options', 'session', 'status'])
+
+/** Deny a Host authority leaked into dynamic code while retaining readonly identity/projection access. */
+function guardHostAuthority(
+  value: unknown,
+  reportFailure?: (error: Error) => void,
+  seen = new WeakMap<object, unknown>(),
+): unknown {
+  if (value instanceof Context) {
+    return rejectAuthority(reportFailure, 'dynamic Cordis code cannot access a host Context')
+  }
+  if (value instanceof Session) {
+    const cached = seen.get(value)
+    if (cached !== undefined) return cached
+    const facade = new Proxy(Object.create(null) as object, {
+      get(_target, prop) {
+        if (prop === 'append') {
+          return (): never => rejectAuthority(reportFailure,
+            'dynamic Cordis code cannot append session events through a borrowed Agent')
+        }
+        if (typeof prop !== 'string') return undefined
+        if (SESSION_READ_FIELDS.has(prop)) {
+          return guardHostAuthority(Reflect.get(value, prop, value), reportFailure, seen)
+        }
+        if (SESSION_READ_METHODS.has(prop)) {
+          const method = Reflect.get(value, prop, value) as (...args: unknown[]) => unknown
+          return (...args: unknown[]): unknown => guardHostAuthority(
+            Reflect.apply(method, value, args), reportFailure, seen,
+          )
+        }
+        return undefined
+      },
+      set: () => rejectAuthority(reportFailure, 'dynamic Cordis session views are read-only'),
+      getPrototypeOf: () => null,
+      ownKeys: () => [...SESSION_READ_FIELDS],
+      getOwnPropertyDescriptor: (_target, prop) => typeof prop === 'string' && SESSION_READ_FIELDS.has(prop)
+        ? { configurable: true, enumerable: true }
+        : undefined,
+      has: (_target, prop) => prop === 'append'
+        || typeof prop === 'string' && (SESSION_READ_FIELDS.has(prop) || SESSION_READ_METHODS.has(prop)),
+    })
+    seen.set(value, facade)
+    return facade
+  }
+  if (isAgentHandle(value)) {
+    const cached = seen.get(value)
+    if (cached !== undefined) return cached
+    const facade = new Proxy(Object.create(null) as object, {
+      get(_target, prop) {
+        if (prop === 'session') return guardHostAuthority(value.session, reportFailure, seen)
+        if (typeof prop === 'string' && AGENT_MUTATORS.has(prop)) {
+          return (): never => rejectAuthority(reportFailure,
+            `dynamic Cordis code cannot use borrowed Agent authority ${JSON.stringify(prop)}`)
+        }
+        if (typeof prop !== 'string' || !AGENT_READ_FIELDS.has(prop)) return undefined
+        return guardHostAuthority(Reflect.get(value, prop, value), reportFailure, seen)
+      },
+      set: () => rejectAuthority(reportFailure, 'dynamic Cordis Agent views are read-only'),
+      getPrototypeOf: () => null,
+      ownKeys: () => [...AGENT_READ_FIELDS],
+      getOwnPropertyDescriptor: (_target, prop) => typeof prop === 'string' && AGENT_READ_FIELDS.has(prop)
+        ? { configurable: true, enumerable: true }
+        : undefined,
+      has: (_target, prop) => typeof prop === 'string'
+        && (AGENT_READ_FIELDS.has(prop) || AGENT_MUTATORS.has(prop)),
+    })
+    seen.set(value, facade)
+    return facade
+  }
+  if (typeof value !== 'object' || value === null) return value
+  if (isServiceHandle(value)) return guardedService(value, 'event carrier', reportFailure ?? (() => undefined))
+  const cached = seen.get(value)
+  if (cached !== undefined) return cached
+  if (Array.isArray(value)) {
+    const output: unknown[] = []
+    seen.set(value, output)
+    for (const item of value) output.push(guardHostAuthority(item, reportFailure, seen))
+    return Object.freeze(output)
+  }
+  if (!isPlainRecord(value)) return value
+  const output: Record<string, unknown> = {}
+  seen.set(value, output)
+  for (const key of Object.keys(value)) {
+    Object.defineProperty(output, key, {
+      value: guardHostAuthority(value[key], reportFailure, seen),
+      enumerable: true,
+    })
+  }
+  return Object.freeze(output)
+}
+
+/** Recognize the only Host handle whose nested Session must never cross raw. */
+function isAgentHandle(value: unknown): value is { readonly session: Session } & object {
+  if (typeof value !== 'object' || value === null) return false
+  try {
+    return (value as { session?: unknown }).session instanceof Session
+  } catch {
+    return false
+  }
+}
+
+/** Recognize a Cordis service or caller-bound service carrier without exposing its ctx. */
+function isServiceHandle(value: object): boolean {
+  try {
+    return (value as { ctx?: unknown }).ctx instanceof Context
+      && typeof (value as { name?: unknown }).name === 'string'
+  } catch {
+    return false
+  }
+}
+
+/** Wrap a plugin callback so every later Host invocation receives authority-safe arguments. */
+function guardPluginCallbacks(
+  value: unknown,
+  reportFailure?: (error: Error) => void,
+  pluginReceiver?: unknown,
+): unknown {
+  if (typeof value === 'function') {
+    return function (this: unknown, ...args: unknown[]): unknown {
+      return Reflect.apply(
+        value,
+        pluginReceiver ?? guardHostAuthority(this, reportFailure),
+        args.map(argument => guardHostAuthority(argument, reportFailure)),
+      )
+    }
+  }
+  if (!Array.isArray(value) && !isPlainRecord(value)) return value
+  return new Proxy(value, {
+    get(target, prop, receiver) {
+      return guardPluginCallbacks(Reflect.get(target, prop, receiver), reportFailure, receiver)
+    },
+  })
+}
+
+function rejectAuthority(reportFailure: ((error: Error) => void) | undefined, message: string): never {
+  const error = new Error(message)
+  reportFailure?.(error)
+  throw error
 }
 
 /* jscpd:ignore-start -- this VM boundary mirrors the session-owned realm-safe intrinsic test */
@@ -580,7 +724,10 @@ export function sandboxDefineTool(options: unknown): ToolDefinition {
       } : {},
     },
     async execute(args: unknown, exec: unknown): Promise<JsonValue> {
-      return cloneJson(await rawExecute(args, exec), 'harness.defineTool execute result') as JsonValue
+      return cloneJson(
+        await rawExecute(args, guardHostAuthority(exec)),
+        'harness.defineTool execute result',
+      ) as JsonValue
     },
   })
   const parameters = { ...tool.parameters, ...normalized.rootAnnotations }
@@ -683,16 +830,38 @@ function denyContext(value: unknown, service: string, reportFailure: (error: Err
  * (plain data) pass through as-is; a returned Promise is guarded on resolve.
  */
 function guardedService(service: object, name: string, reportFailure: (error: Error) => void): unknown {
-  return new Proxy(service, {
-    get(target, prop) {
-      const value = Reflect.get(target, prop, target) as unknown
-      if (typeof value !== 'function') return denyContext(value, name, reportFailure)
+  return new Proxy(Object.create(null) as object, {
+    get(_target, prop) {
+      if (prop === 'ctx') {
+        return rejectGuard(reportFailure,
+          `service "${name}" returned a cordis Context, which the sandbox does not expose. `
+          + 'Operate through your own plugin ctx (ctx.on / ctx.provide / ctx.tools.register) '
+          + 'and the services you inject — never another context.')
+      }
+      if (typeof prop !== 'string' || prop === 'constructor'
+        || prop === 'typertRemote' || prop.startsWith('_')) return undefined
+      const value = Reflect.get(service, prop, service) as unknown
+      if (typeof value !== 'function') {
+        return guardHostAuthority(denyContext(value, name, reportFailure), reportFailure)
+      }
       return (...args: unknown[]): unknown => {
-        const result = Reflect.apply(value, target, args) as unknown
-        if (result instanceof Promise) return result.then(v => denyContext(v, name, reportFailure))
-        return denyContext(result, name, reportFailure)
+        const guardedArgs = args.map(argument => guardPluginCallbacks(argument, reportFailure))
+        const result = Reflect.apply(value, service, guardedArgs) as unknown
+        if (result instanceof Promise) {
+          return result.then(v => guardHostAuthority(denyContext(v, name, reportFailure), reportFailure))
+        }
+        return guardHostAuthority(denyContext(result, name, reportFailure), reportFailure)
       }
     },
+    set: (_target, prop) => rejectGuard(
+      reportFailure, `service "${name}" is read-only; cannot assign ${JSON.stringify(String(prop))}`,
+    ),
+    getPrototypeOf: () => null,
+    ownKeys: () => [],
+    getOwnPropertyDescriptor: () => undefined,
+    has: (_target, prop) => typeof prop === 'string'
+      && prop !== 'constructor' && prop !== 'ctx' && prop !== 'typertRemote'
+      && !prop.startsWith('_') && Reflect.has(service, prop),
   })
 }
 /* jscpd:ignore-end */
@@ -761,7 +930,11 @@ function sandboxContext(ctx: Context, reportFailure: (error: Error) => void): Co
         return (...args: unknown[]): unknown => {
           if (TIMER_VERBS.has(prop) && !declared.has('timer')) return denyRead('timer')
           const method = ctx[prop as keyof Context]
-          return Reflect.apply(method as (...a: unknown[]) => unknown, ctx, args)
+          return Reflect.apply(
+            method as (...a: unknown[]) => unknown,
+            ctx,
+            args.map(argument => guardPluginCallbacks(argument, reportFailure)),
+          )
         }
       }
       return readService(prop, true)

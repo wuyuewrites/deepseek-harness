@@ -2,11 +2,11 @@
 
 [English](README.md) | 中文
 
-与通道无关的一次性审批 seam。`ctx.approval.request(req)` 返回 `allowed-once`、`rejected`、`cancelled` 或 `unavailable`；应答者缺失或失败时会以拒绝方式关闭，授权也只适用于所请求的操作。确切事件签名见 [approval.md](../../../docs/subsystems/approval.zh.md#cordis-surface) 的生成区块。
+与通道无关的一次性审批 seam。`ctx.approval.request(req)` 返回 `allowed-once`、`rejected`、`cancelled` 或 `unavailable`；应答者缺失或失败时会以拒绝方式关闭，授权也只适用于所请求的操作。应答者可以返回 legacy 结果或由静态宿主 ingress 铸造的不透明答案；`requiredActor: 'interactive-user'` 会把任何 bare、external-client、automation、policy 或 unavailable 的授权变为 `unavailable`。确切事件签名见 [approval.md](../../../docs/subsystems/approval.zh.md#cordis-surface) 的生成区块。
 
 每个请求都必须属于一个尚未结束的 agent（智能体）轮次。服务会追加一对 `approval/asked` 与 `approval/decided` 审计记录，而模型只会看到由此产生且已写入日志的工具结果。已中止的请求会解析为 `cancelled`；如果审计记录的追加在提交前失败，Promise 会被拒绝，而不会返回一项未记录的决定。
 
-应答者是 `approval/request` waterfall（瀑布式事件）监听器。要回答其负责的 agent 请求，请返回一个结果；否则调用 `next()` 委托。限定到 agent 的监听器只接收该 agent 的请求；每项部署应当组合一个最终应答者，因为同级监听器的顺序不是策略优先级机制。ACP（Agent Client Protocol）自动化桥接层为其负责的会话提供一次性机器决定。
+应答者是 `approval/request` waterfall（瀑布式事件）监听器。要回答其负责的 agent 请求，请返回一个结果；否则调用 `next()` 委托。受信任的静态宿主适配器则通过 `createApprovalIngress(owner, actor)` 创建 `ApprovalIngress`，并返回 `ingress.answer(request, outcome)`。该不透明答案绑定 exact `ApprovalService`、冻结请求、owner 作用域与 owner fiber；铸造和应答都不是 `ctx.approval` 方法，也不会进入动态 Cordis catalog。限定到 agent 的监听器只接收该 agent 的请求；每项部署应当组合一个最终应答者，因为同级监听器的顺序不是策略优先级机制。ACP（Agent Client Protocol）自动化桥接层为其负责的会话提供一次性机器决定。
 
 `ApprovalPolicy` 为 `'ask'` 或 `'never'`。实际值取最后一条 `approval/policy` 事件，并回退到配置；`setApprovalPolicy()` 是写入路径。`'never'` 会在交互式分发之前拒绝请求。两种策略都会将各自完整的当前含义贡献给缓存安全的运行时上下文快照。
 
@@ -60,3 +60,4 @@ Approval prompts are disabled in this session: actions that require approval are
 - **仅存在一次性授权**：结果词汇包含 `allowed-once`，但不含 `allow-always`、已记住的规则、撤销或授权存储；会话策略只有 `ask`／`never`。
 - **请求不携带工具参数**：应答者会看到工具名称、原因和可选调用 id；ACP 机器通道要求调用 id，并会委托不含 id 的请求。
 - **没有内置应答者**：无头或组合不完整的部署会返回 `unavailable` 并以拒绝方式关闭；服务自身绝不会提示人类。
+- **尚无随产品交付的 interactive-user 证明者**：通用 API proxy 将其响应记录为 `external-client/api`，ACP 记录为 `external-client/acp`，当前没有 CLI 适配器能够证明交互式 TTY 手势。需要 `requiredActor: 'interactive-user'` 的部署必须组合专用且受信任的 UI 或 TTY ingress；不得把这些传输重标为人类。

@@ -2,11 +2,11 @@
 
 English | [中文](README.zh.md)
 
-Channel-neutral one-shot approval seam. `ctx.approval.request(req)` returns `allowed-once`, `rejected`, `cancelled`, or `unavailable`; missing or failing answerers fail closed, and a grant applies only to the requested action. Exact event signatures live in the generated region of [approval.md](../../../docs/subsystems/approval.md#cordis-surface).
+Channel-neutral one-shot approval seam. `ctx.approval.request(req)` returns `allowed-once`, `rejected`, `cancelled`, or `unavailable`; missing or failing answerers fail closed, and a grant applies only to the requested action. An answerer may return a legacy outcome or an opaque answer minted by a static Host ingress; `requiredActor: 'interactive-user'` turns any bare, external-client, automation, policy, or unavailable grant into `unavailable`. Exact event signatures live in the generated region of [approval.md](../../../docs/subsystems/approval.md#cordis-surface).
 
 Each request must belong to an open agent turn. The service appends a paired `approval/asked` and `approval/decided` audit record, while the model sees only the resulting logged tool outcome. An aborted request resolves `cancelled`; an audit append that fails before commit rejects rather than returning an unlogged decision.
 
-Answerers are `approval/request` waterfall listeners. Return an outcome to answer for an owned agent or call `next()` to delegate. Agent-scoped listeners receive only that agent's requests; compose one terminal answerer per deployment because sibling listener order is not a policy priority mechanism. The ACP automation bridge supplies one-shot machine decisions for sessions it owns.
+Answerers are `approval/request` waterfall listeners. Return an outcome to answer for an owned agent or call `next()` to delegate. A trusted static Host adapter instead creates an `ApprovalIngress` with `createApprovalIngress(owner, actor)` and returns `ingress.answer(request, outcome)`. The opaque answer is bound to the exact `ApprovalService`, frozen request, owner scope, and owner fiber; neither minting nor answering is a `ctx.approval` method or dynamic Cordis catalog capability. Agent-scoped listeners receive only that agent's requests; compose one terminal answerer per deployment because sibling listener order is not a policy priority mechanism. The ACP automation bridge supplies one-shot machine decisions for sessions it owns.
 
 `ApprovalPolicy` is `'ask'` or `'never'`. The effective value is the last `approval/policy` event, falling back to config; `setApprovalPolicy()` is the write path. `'never'` rejects before interactive dispatch. Both policies contribute their complete current meaning to the cache-safe runtime-context snapshot.
 
@@ -60,3 +60,4 @@ Append-only; newly visible content follows the reusable request prefix and does 
 - **Only one-shot grants exist** — the outcome vocabulary has `allowed-once` but no `allow-always`, remembered rule, revocation, or grant store; session policy is only `ask` / `never`.
 - **The request carries no tool arguments** — an answerer sees the tool name, reason, and optional call id; the ACP machine channel requires a call id and delegates requests without one.
 - **No built-in answerer** — headless or incompletely composed deployments resolve `unavailable` and fail closed; the service itself never prompts a human.
+- **No shipped interactive-user attester** — the generic API proxy records its responses as `external-client/api`, ACP as `external-client/acp`, and no current CLI adapter proves an interactive TTY gesture. A deployment that needs `requiredActor: 'interactive-user'` must compose a dedicated trusted UI or TTY ingress; it must not relabel these transports as human.

@@ -69,16 +69,32 @@ function denyContext(value: unknown, service: string, env: DynamicCordisGuardEnv
  * effects land on the calling plugin's fiber — while denying Context returns.
  */
 function guardedService(service: object, name: string, env: DynamicCordisGuardEnv): unknown {
-  return new Proxy(service, {
-    get(target, prop) {
-      const value = Reflect.get(target, prop, target) as unknown
+  return new Proxy(Object.create(null) as object, {
+    get(_target, prop) {
+      if (prop === 'ctx') {
+        return rejectGuard(env,
+          `service "${name}" returned a cordis Context, which the dynamic facade does not expose. `
+          + 'Operate through your own plugin ctx and the services you declared — never another context.')
+      }
+      if (typeof prop !== 'string' || prop === 'constructor'
+        || prop === 'typertRemote' || prop.startsWith('_')) return undefined
+      const value = Reflect.get(service, prop, service) as unknown
       if (typeof value !== 'function') return denyContext(value, name, env)
       return (...args: unknown[]): unknown => {
-        const result = Reflect.apply(value, target, args) as unknown
+        const result = Reflect.apply(value, service, args) as unknown
         if (result instanceof Promise) return result.then(resolved => denyContext(resolved, name, env))
         return denyContext(result, name, env)
       }
     },
+    set: (_target, prop) => rejectGuard(
+      env, `service "${name}" is read-only; cannot assign ${JSON.stringify(String(prop))}`,
+    ),
+    getPrototypeOf: () => null,
+    ownKeys: () => [],
+    getOwnPropertyDescriptor: () => undefined,
+    has: (_target, prop) => typeof prop === 'string'
+      && prop !== 'constructor' && prop !== 'ctx' && prop !== 'typertRemote'
+      && !prop.startsWith('_') && Reflect.has(service, prop),
   })
 }
 

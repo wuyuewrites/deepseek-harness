@@ -28,6 +28,8 @@ type ApprovalRequestId = Branded<'ApprovalRequestId'>
 type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 ```
 
+`InteractionActor` is a closed host-attested record: `interactive-user` is limited to verified Web or CLI ingress, while generic API and ACP clients are `external-client`; automation, policy, and system decisions remain distinct. `ApprovalDecision` is the durable outcome-plus-actor view. An answerer cannot submit that structure: `ApprovalAnswer` permits only a legacy bare outcome or an opaque answer minted by `createApprovalIngress(owner, actor)` and bound to the exact service, request, scope, and owner lifetime. `requiredActor: 'interactive-user'` is persisted on `approval/asked`; only a matching opaque `allowed-once` remains a grant. Old bare events stay readable but never satisfy that requirement.
+
 ## Per-session policy
 
 `ApprovalPolicy` determines what happens before interactive answerers run. `ask` delegates to the composed answerer chain, whose no-answer default is `unavailable`; `never` deterministically returns `rejected` without dispatching any answerer. The effective value is the last `approval/policy` event in the session log, falling back to the service config. `setApprovalPolicy(session, policy)` is the single write path, so replay reconstructs the override.
@@ -74,6 +76,12 @@ interface ApprovalRequest {
   /** The asker's human-readable explanation of WHY it is asking. */
   readonly reason?: string
   /**
+   * Require a host-attested actor kind before `allowed-once` can reach the
+   * caller. A bare legacy outcome becomes `unavailable` when it cannot prove
+   * this requirement.
+   */
+  readonly requiredActor?: RequiredInteractionActor
+  /**
    * Aborting withdraws the question: the request settles `'cancelled'`
    * immediately and a late answer from a still-pending answerer is discarded.
    */
@@ -83,7 +91,7 @@ interface ApprovalRequest {
 
 ## Dispatch and audit
 
-`ctx.approval.request(req)` requires the requesting session to be inside an open turn. It appends `approval/asked`, obtains one outcome, appends the matching `approval/decided`, and resolves with that outcome. The `never` policy is enforced inside the service before waterfall dispatch, so even an answerer registered later with `prepend` cannot bypass it. Answerers return an outcome when they own the request or call `next()` to delegate; the first answer occupies the single decision slot.
+`ctx.approval.request(req)` requires the requesting session to be inside an open turn. It snapshots the request, appends `approval/asked`, obtains one answer, appends the matching `approval/decided`, and resolves with the closed outcome. The `never` policy is enforced inside the service before waterfall dispatch, so even an answerer registered later with `prepend` cannot bypass it. Answerers return a legacy outcome or opaque Host-ingress answer when they own the request, or call `next()` to delegate; the first answer occupies the single decision slot. The ingress factory is a static module API, not a `ctx.approval` or dynamic Cordis capability. A generic API or ACP answer is not interactive-user provenance.
 
 The audit events are log-only and do not enter the model transcript. Model-visible behavior is the caller's derived tool result plus the current runtime-context snapshot. Service disposal removes its context contribution; answerer listeners are independently effect-bound to their owning plugins.
 
@@ -151,17 +159,18 @@ Source: [`packages/interaction/user-approval/src/index.ts`](../../packages/inter
 
 #### `approval/request` — waterfall
 
-Ask composed answerers for one decision. Return an outcome to claim the request or call `next()`; failure yields the fail-closed default. Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
+Ask composed answerers for one decision. Return a legacy outcome or an opaque Host-ingress answer to claim the request, or call `next()`; failure yields the fail-closed default. Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
 
 ```ts cordis-catalog
 /**
- * Ask composed answerers for one decision. Return an outcome to claim the
- * request or call `next()`; failure yields the fail-closed default.
+ * Ask composed answerers for one decision. Return a legacy outcome or an
+ * opaque Host-ingress answer to claim the request, or call `next()`;
+ * failure yields the fail-closed default.
  * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
  * @param req - the pending decision (agent, tool identity, reason, signal).
  * @mode waterfall
  */
-'approval/request'(this: Scoped<ApprovalService>, req: ApprovalRequest, next: () => Promise<ApprovalOutcome>): Promise<ApprovalOutcome>
+'approval/request'(this: Scoped<ApprovalService>, req: ApprovalRequest, next: () => Promise<ApprovalAnswer>): Promise<ApprovalAnswer>
 ```
 
 Types: [Scoped](scope.md)

@@ -155,12 +155,14 @@ Source: [`packages/preset/agent-presets/src/session.ts:26`](../packages/preset/a
   toolName: string
   callId?: CallId
   reason?: string
+  /** Required host-attested actor kind; absent preserves ordinary approval semantics. */
+  requiredActor?: RequiredInteractionActor
 }
 ```
 
 Types: [CallId](subsystems/core.md)
 
-Source: [`packages/interaction/user-approval/src/index.ts:44`](../packages/interaction/user-approval/src/index.ts)
+Source: [`packages/interaction/user-approval/src/index.ts:45`](../packages/interaction/user-approval/src/index.ts)
 
 <a id="approvaldecided--log-only"></a>
 
@@ -175,10 +177,12 @@ Source: [`packages/interaction/user-approval/src/index.ts:44`](../packages/inter
 'approval/decided': {
   id: ApprovalRequestId
   outcome: ApprovalOutcome
+  /** Host-minted answer provenance; absent identifies a legacy/unattributed outcome. */
+  decidedBy?: InteractionActor
 }
 ```
 
-Source: [`packages/interaction/user-approval/src/index.ts:55`](../packages/interaction/user-approval/src/index.ts)
+Source: [`packages/interaction/user-approval/src/index.ts:58`](../packages/interaction/user-approval/src/index.ts)
 
 <a id="approvalpolicy--log-only"></a>
 
@@ -200,7 +204,7 @@ Source: [`packages/interaction/user-approval/src/index.ts:55`](../packages/inter
 }
 ```
 
-Source: [`packages/interaction/user-approval/src/index.ts:67`](../packages/interaction/user-approval/src/index.ts)
+Source: [`packages/interaction/user-approval/src/index.ts:72`](../packages/interaction/user-approval/src/index.ts)
 
 ### `assistant/*`
 
@@ -260,7 +264,7 @@ Source: [`packages/core/session/src/types.ts:315`](../packages/core/session/src/
 }
 ```
 
-Source: [`packages/interaction/commands/src/types.ts:103`](../packages/interaction/commands/src/types.ts)
+Source: [`packages/interaction/commands/src/types.ts:109`](../packages/interaction/commands/src/types.ts)
 
 <a id="commandrun--log-only"></a>
 
@@ -280,7 +284,7 @@ Source: [`packages/interaction/commands/src/types.ts:103`](../packages/interacti
 'command/run': { commandId: CommandId; name: string; args?: string; source: CommandSource }
 ```
 
-Source: [`packages/interaction/commands/src/types.ts:96`](../packages/interaction/commands/src/types.ts)
+Source: [`packages/interaction/commands/src/types.ts:102`](../packages/interaction/commands/src/types.ts)
 
 ### `compaction/*`
 

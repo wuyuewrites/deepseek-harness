@@ -17,6 +17,7 @@
 - `ctx.sessions.fork(source, boundary?, childSessionId?): Session`：解析实时会话对象或 id，选取截至 `boundary` 事件序号（含该事件）的种子（默认为当前最后一个事件），要求所选前缀结束时没有开放轮次，再创建带谱系元数据的实时子会话。
 - `ctx.sessions.registerEventExtension(descriptor)` 注册一个带作用域的仓库外事件描述符，并返回由 fiber 所有的追加 handle。每次追加都写入核心认识的 `session-extension/event` carrier，其中包含 owner、事件类型、schema 版本、继续运行要求和载荷。required carrier 在实时发布前需要当前作用域可见的精确注册；ignorable carrier 在 owner 缺失时仍可读取和恢复。
 - `ctx.sessions.assertEventExtensionsCompatible(session)` 按调用方作用域检查一个脱离态或实时会话，不发布也不修改它。
+- `ctx.sessions.assertLiveEventExtensionsCompatible(session)` 按会话进入 store 时捕获的作用域检查精确的实时会话；有副作用的运行时会在调用 body 前立即使用它，避免全局调用方借用另一项注册的作用域。
 - `ctx.sessions.get(id: SessionId): Session | undefined`
 - `ctx.sessions.list(): Session[]`
 

@@ -13,7 +13,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import SessionStore from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
-import ApprovalService from '@deepseek-ai/dsh-user-approval'
+import ApprovalService, { createApprovalIngress } from '@deepseek-ai/dsh-user-approval'
 import type { ApprovalRequestId } from '@deepseek-ai/dsh-user-approval'
 import type { ApiProxy, MuxFrame, RpcRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
 import type { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
@@ -107,6 +107,62 @@ describe('approval pending registry', () => {
     const dup = await api.respond(answer(envelope.rpcId, requested.sessionId, requested.approvalId, 'rejected'))
     expect(dup).toEqual({ accepted: false, reason: 'not-pending' })
     abort.abort()
+  })
+
+  it('ignores a client-reported actor and records the API Host ingress actor', async () => {
+    const { ctx, api } = await harness()
+    const abort = new AbortController()
+    const mux = openMux(api, abort)
+    const agent = agentOf(ctx)
+    const asked = ctx.approval.request({ agent, toolName: 'bash' })
+    const requested = requestedOf(await mux.waitFor('approval/requested'))
+    const envelope = mux.envelopes.find(e => e.payload.type === 'approval/requested') as RpcRequest<MuxFrame>
+    const forged = {
+      type: 'client-response' as const,
+      rpcId: envelope.rpcId,
+      result: {
+        ok: true as const,
+        value: {
+          sessionId: requested.sessionId,
+          approvalId: requested.approvalId,
+          outcome: 'allowed-once' as const,
+          decidedBy: { kind: 'interactive-user', channel: 'web' },
+        },
+      },
+    }
+
+    expect(await api.respond(forged)).toEqual({ accepted: true })
+    await expect(asked).resolves.toBe('allowed-once')
+    const decided = agent.session.events.findLast(event => event.type === 'approval/decided')
+    expect(decided).toMatchObject({
+      data: { outcome: 'allowed-once', decidedBy: { kind: 'external-client', channel: 'api' } },
+    })
+    abort.abort()
+  })
+
+  it('delegates an interactive-user requirement to a later opaque trusted provider', async () => {
+    const { ctx, api } = await harness()
+    const abort = new AbortController()
+    const mux = openMux(api, abort)
+    const agent = agentOf(ctx)
+    const ingress = createApprovalIngress(ctx, {
+      kind: 'interactive-user', channel: 'cli', principalId: 'operator-1',
+    })
+    ctx.on('approval/request', request => Promise.resolve(ingress.answer(request, 'allowed-once')))
+
+    await expect(ctx.approval.request({
+      agent, toolName: 'bash', requiredActor: 'interactive-user',
+    })).resolves.toBe('allowed-once')
+    expect(mux.frames.some(frame => frame.type === 'approval/requested')).toBe(false)
+    const decided = agent.session.events.findLast(event => event.type === 'approval/decided')
+    expect(decided).toMatchObject({
+      data: {
+        outcome: 'allowed-once',
+        decidedBy: { kind: 'interactive-user', channel: 'cli', principalId: 'operator-1' },
+      },
+    })
+    abort.abort()
+    void api
   })
 
   it('replays a still-pending requested frame (same rpcId) on a later mux open', async () => {
@@ -228,6 +284,49 @@ describe('approval pending registry', () => {
     await expect(asked).resolves.toBe('cancelled')
     const resolved = await mux.waitFor('approval/resolved')
     expect(resolved).toMatchObject({ approvalId: requested.approvalId, outcome: 'cancelled' })
+    abort.abort()
+  })
+
+  it('tracks ApprovalService late install and HMR with a fresh exact-service ingress', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SystemPrompt, { persona: '' })
+    await ctx.plugin(UserQuestionService)
+    await ctx.plugin(AgentRegistry)
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => ({ provider: 'p', model: 'm' }), cwd: '/tmp',
+    })
+    const abort = new AbortController()
+    const mux = openMux(api, abort)
+
+    let approvalFiber = ctx.plugin(ApprovalService)
+    await approvalFiber
+    const firstAgent = agentOf(ctx)
+    const firstAsk = ctx.approval.request({ agent: firstAgent, toolName: 'bash' })
+    const firstRequested = requestedOf(await mux.waitFor('approval/requested'))
+    const firstEnvelope = mux.envelopes.find(envelope =>
+      envelope.payload.type === 'approval/requested') as RpcRequest<MuxFrame>
+    expect(await api.respond(answer(
+      firstEnvelope.rpcId, firstRequested.sessionId, firstRequested.approvalId, 'allowed-once',
+    ))).toEqual({ accepted: true })
+    await expect(firstAsk).resolves.toBe('allowed-once')
+
+    await approvalFiber.dispose()
+    approvalFiber = ctx.plugin(ApprovalService)
+    await approvalFiber
+    const secondAgent = agentOf(ctx)
+    const secondAsk = ctx.approval.request({ agent: secondAgent, toolName: 'bash' })
+    await waitForCount(mux, 'approval/requested', 2)
+    const secondEnvelope = mux.envelopes.filter(envelope =>
+      envelope.payload.type === 'approval/requested').at(-1) as RpcRequest<MuxFrame>
+    const secondRequested = requestedOf(secondEnvelope.payload)
+    expect(await api.respond(answer(
+      secondEnvelope.rpcId, secondRequested.sessionId, secondRequested.approvalId, 'rejected',
+    ))).toEqual({ accepted: true })
+    await expect(secondAsk).resolves.toBe('rejected')
+    expect(secondAgent.session.events.findLast(event => event.type === 'approval/decided')).toMatchObject({
+      data: { outcome: 'rejected', decidedBy: { kind: 'external-client', channel: 'api' } },
+    })
     abort.abort()
   })
 

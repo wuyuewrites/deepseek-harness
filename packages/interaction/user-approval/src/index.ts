@@ -21,13 +21,14 @@ declare module '@deepseek-ai/cordis' {
 
   interface Events {
     /**
-     * Ask composed answerers for one decision. Return an outcome to claim the
-     * request or call `next()`; failure yields the fail-closed default.
+     * Ask composed answerers for one decision. Return a legacy outcome or an
+     * opaque Host-ingress answer to claim the request, or call `next()`;
+     * failure yields the fail-closed default.
      * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
      * @param req - the pending decision (agent, tool identity, reason, signal).
      * @mode waterfall
      */
-    'approval/request'(this: Scoped<ApprovalService>, req: ApprovalRequest, next: () => Promise<ApprovalOutcome>): Promise<ApprovalOutcome>
+    'approval/request'(this: Scoped<ApprovalService>, req: ApprovalRequest, next: () => Promise<ApprovalAnswer>): Promise<ApprovalAnswer>
   }
 }
 
@@ -46,6 +47,8 @@ declare module '@deepseek-ai/dsh-session/types' {
       toolName: string
       callId?: CallId
       reason?: string
+      /** Required host-attested actor kind; absent preserves ordinary approval semantics. */
+      requiredActor?: RequiredInteractionActor
     }
     /**
      * The outcome of a prior `approval/asked` (same `id`) — log-only audit.
@@ -55,6 +58,8 @@ declare module '@deepseek-ai/dsh-session/types' {
     'approval/decided': {
       id: ApprovalRequestId
       outcome: ApprovalOutcome
+      /** Host-minted answer provenance; absent identifies a legacy/unattributed outcome. */
+      decidedBy?: InteractionActor
     }
     /**
      * The session's approval policy was switched — log-only, durable,
@@ -72,14 +77,44 @@ declare module '@deepseek-ai/dsh-session/types' {
   }
 }
 
+import { actorSatisfiesRequirement } from './actor.ts'
+import { consumeApprovalAnswer } from './approval-ingress.ts'
 import { ApprovalRequestId } from './types.ts'
-import type { ApprovalOutcome } from './types.ts'
+import type {
+  ApprovalAnswer,
+  ApprovalOutcome,
+  InteractionActor,
+  RequiredInteractionActor,
+} from './types.ts'
 
 export { ApprovalRequestId } from './types.ts'
-export type { ApprovalOutcome } from './types.ts'
+export { createApprovalIngress } from './approval-ingress.ts'
+export type { ApprovalIngress } from './approval-ingress.ts'
+export {
+  actorSatisfiesRequirement,
+  isActorQualifiedApprovalGrant,
+  isInteractionActor,
+  snapshotInteractionActor,
+} from './actor.ts'
+export type {
+  ApprovalAnswer,
+  ApprovalDecision,
+  ApprovalOutcome,
+  InteractionActor,
+  RequiredInteractionActor,
+} from './types.ts'
 
 /** Every {@link ApprovalOutcome}, for runtime normalization of answerer returns. */
 const OUTCOMES: readonly ApprovalOutcome[] = ['allowed-once', 'rejected', 'cancelled', 'unavailable']
+
+/** One normalized answer before it is durably paired with an ask. */
+interface ResolvedApprovalDecision {
+  readonly outcome: ApprovalOutcome
+  readonly decidedBy?: InteractionActor
+}
+
+/** The built-in policy path is a host decision, never an interactive user. */
+const NEVER_POLICY_ACTOR: InteractionActor = Object.freeze({ kind: 'policy', policy: 'approval-policy-never' })
 
 /**
  * A session's approval policy — what happens to an {@link ApprovalService}
@@ -167,10 +202,55 @@ export interface ApprovalRequest {
   /** The asker's human-readable explanation of WHY it is asking. */
   readonly reason?: string
   /**
+   * Require a host-attested actor kind before `allowed-once` can reach the
+   * caller. A bare legacy outcome becomes `unavailable` when it cannot prove
+   * this requirement.
+   */
+  readonly requiredActor?: RequiredInteractionActor
+  /**
    * Aborting withdraws the question: the request settles `'cancelled'`
    * immediately and a late answer from a still-pending answerer is discarded.
    */
   readonly signal?: AbortSignal
+}
+
+/** Snapshot and freeze the complete request before audit or asynchronous dispatch begins. */
+function snapshotApprovalRequest(input: ApprovalRequest): Readonly<ApprovalRequest> {
+  const agent: unknown = input.agent
+  const toolName: unknown = input.toolName
+  const callId: unknown = input.callId
+  const reason: unknown = input.reason
+  const requiredActor: unknown = input.requiredActor
+  const signal: unknown = input.signal
+  if (typeof agent !== 'object' || agent === null || !('session' in agent)) {
+    throw new TypeError('approval request agent must carry a session')
+  }
+  if (typeof toolName !== 'string' || toolName.length === 0) {
+    throw new TypeError('approval request toolName must be a non-empty string')
+  }
+  if (callId !== undefined && (typeof callId !== 'string' || callId.length === 0)) {
+    throw new TypeError('approval request callId must be a non-empty string when supplied')
+  }
+  if (reason !== undefined && typeof reason !== 'string') {
+    throw new TypeError('approval request reason must be a string when supplied')
+  }
+  if (requiredActor !== undefined && requiredActor !== 'interactive-user') {
+    throw new TypeError('approval requiredActor must be "interactive-user" when supplied')
+  }
+  if (signal !== undefined && (typeof signal !== 'object' || signal === null
+    || typeof (signal as Partial<AbortSignal>).aborted !== 'boolean'
+    || typeof (signal as Partial<AbortSignal>).addEventListener !== 'function'
+    || typeof (signal as Partial<AbortSignal>).removeEventListener !== 'function')) {
+    throw new TypeError('approval request signal must be an AbortSignal when supplied')
+  }
+  return Object.freeze({
+    agent: agent as Agent,
+    toolName,
+    ...callId === undefined ? {} : { callId: callId as CallId },
+    ...reason === undefined ? {} : { reason },
+    ...requiredActor === undefined ? {} : { requiredActor },
+    ...signal === undefined ? {} : { signal: signal as AbortSignal },
+  })
 }
 
 /** Plugin config. All optional — `static Config` supplies the defaults. */
@@ -255,7 +335,8 @@ export class ApprovalService extends Service {
    *   append commit point.
    */
   async request(req: ApprovalRequest): Promise<ApprovalOutcome> {
-    const session = req.agent.session
+    const request = snapshotApprovalRequest(req)
+    const session = request.agent.session
     if (!hasOpenTurn(session.events)) {
       throw new Error(
         'approval.request() outside an open turn: the approval/asked + approval/decided audit pair '
@@ -266,13 +347,18 @@ export class ApprovalService extends Service {
     const id = ApprovalRequestId(randomUUID())
     session.append('approval/asked', {
       id,
-      toolName: req.toolName,
-      ...req.callId !== undefined ? { callId: req.callId } : {},
-      ...req.reason !== undefined ? { reason: req.reason } : {},
+      toolName: request.toolName,
+      ...request.callId !== undefined ? { callId: request.callId } : {},
+      ...request.reason !== undefined ? { reason: request.reason } : {},
+      ...request.requiredActor !== undefined ? { requiredActor: request.requiredActor } : {},
     })
-    const outcome = await this.decide(req, session)
-    session.append('approval/decided', { id, outcome })
-    return outcome
+    const decision = await this.decide(request, session)
+    session.append('approval/decided', {
+      id,
+      outcome: decision.outcome,
+      ...decision.decidedBy !== undefined ? { decidedBy: decision.decidedBy } : {},
+    })
+    return decision.outcome
   }
 
   /**
@@ -301,47 +387,70 @@ export class ApprovalService extends Service {
    * @param session - the request agent's session used for policy lookup.
    * @returns the normalized closed outcome.
    */
-  private async decide(req: ApprovalRequest, session: Session): Promise<ApprovalOutcome> {
+  private async decide(req: ApprovalRequest, session: Session): Promise<ResolvedApprovalDecision> {
     const signal = req.signal
-    if (signal?.aborted) return 'cancelled'
+    if (signal?.aborted) return { outcome: 'cancelled' }
     // The 'never' policy is decided HERE, before any dispatch: a listener
     // registered with `prepend: true` after this service mounts would sit
     // ahead of any gate LISTENER, so a listener-shaped gate cannot keep the
     // documented promise that 'never' rejects deterministically regardless
     // of registration order — only the service's own request path can.
-    if (this.effectivePolicy(session) === 'never') return 'rejected'
+    if (this.effectivePolicy(session) === 'never') {
+      return { outcome: 'rejected', decidedBy: NEVER_POLICY_ACTOR }
+    }
     // Enter the promise chain BEFORE dispatching: a listener that throws
     // SYNCHRONOUSLY (before its first await) must land in the same rejection
     // path as an async one — `Promise.resolve(call())` would let it escape
     // the containment into the caller.
-    const answer: Promise<ApprovalOutcome> = Promise.resolve().then(
+    const answer: Promise<ResolvedApprovalDecision> = Promise.resolve().then(
       () => this.ctx.waterfall(
         scopeTarget(this, req.agent), 'approval/request', req,
-        () => Promise.resolve<ApprovalOutcome>('unavailable'),
+        () => Promise.resolve<ApprovalAnswer>('unavailable'),
       ),
     ).then(
-      // Normalize a rogue (non-vocabulary) answerer return to the fail-closed
-      // outcome instead of leaking it into callers' closed-union switches.
-      outcome => OUTCOMES.includes(outcome) ? outcome : 'unavailable',
+      value => normalizeApprovalAnswer(this, req, value),
       // A throwing answerer must fail the QUESTION closed, not the caller's
       // tool call open — the seam contains its callbacks.
-      () => 'unavailable',
+      () => ({ outcome: 'unavailable' }),
     )
-    if (signal === undefined) return answer
-    return await new Promise<ApprovalOutcome>((resolve) => {
-      const onAbort = () => {
-        signal.removeEventListener('abort', onAbort)
-        resolve('cancelled')
-      }
-      signal.addEventListener('abort', onAbort, { once: true })
-      void answer.then((outcome) => {
-        signal.removeEventListener('abort', onAbort)
-        // After an abort won the race this resolve is a settled-promise no-op:
-        // the late answer is discarded by construction.
-        resolve(outcome)
+    const decision = signal === undefined
+      ? await answer
+      : await new Promise<ResolvedApprovalDecision>((resolve) => {
+        const onAbort = () => {
+          signal.removeEventListener('abort', onAbort)
+          resolve({ outcome: 'cancelled' })
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+        void answer.then((outcome) => {
+          signal.removeEventListener('abort', onAbort)
+          // After an abort won the race this resolve is a settled-promise no-op:
+          // the late answer is discarded by construction.
+          resolve(outcome)
+        })
       })
-    })
+    if (decision.outcome === 'allowed-once'
+      && !actorSatisfiesRequirement(decision.decidedBy, req.requiredActor)) {
+      return {
+        outcome: 'unavailable',
+        ...decision.decidedBy === undefined ? {} : { decidedBy: decision.decidedBy },
+      }
+    }
+    return decision
   }
+}
+
+/** Normalize an answerer return without accepting actor data from an unchecked object. */
+function normalizeApprovalAnswer(
+  service: ApprovalService,
+  request: ApprovalRequest,
+  answer: unknown,
+): ResolvedApprovalDecision {
+  if (typeof answer === 'string') {
+    return OUTCOMES.includes(answer as ApprovalOutcome)
+      ? { outcome: answer as ApprovalOutcome }
+      : { outcome: 'unavailable' }
+  }
+  return consumeApprovalAnswer(service, request, answer) ?? { outcome: 'unavailable' }
 }
 
 export default ApprovalService

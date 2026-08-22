@@ -8,6 +8,7 @@
  */
 
 import type { CommandId } from './brand.ts'
+import type { InteractionActor } from '@deepseek-ai/dsh-user-approval/types'
 
 /** Immutable metadata for a command's optional unstructured input. */
 export interface CommandInputDescriptor {
@@ -58,12 +59,17 @@ export interface CommandDescriptor {
 
 /**
  * Producer record for one command invocation (the `command/run` event's
- * source slot). Merge-extensible sum type mirroring `MessageSourceMap`'s
- * shape; minimal today because every executor caller is a human-facing UI
- * surface dispatching a human-typed line, so the sole variant is `user`.
+ * source slot). `user` is a legacy durable record: it remains readable but
+ * never proves a host-attested interactive actor. New legacy callers write
+ * `unattributed`; trusted host ingress writes `interaction` with its actor.
  */
-export interface CommandSourceMap {
+export type CommandSourceMap = {
+  /** Legacy durable source retained for historical session logs. */
   user: { kind: 'user' }
+  /** Existing direct executor entrypoint with no trusted ingress provenance. */
+  unattributed: { kind: 'unattributed' }
+  /** Host-minted interaction provenance from an opaque trusted ingress. */
+  interaction: { kind: 'interaction'; actor: InteractionActor }
 }
 
 /** The union over {@link CommandSourceMap} — who issued a command line. */

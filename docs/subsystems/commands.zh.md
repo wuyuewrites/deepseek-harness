@@ -59,10 +59,14 @@ interface CommandDefinition {
 interface CommandInvocation {
   /** Pairing id already written to this invocation's `command/run` event. */
   readonly commandId: CommandId
+  /** Registered command name selected by the parser. */
+  readonly name: string
   /** Exact agent whose UI received the command. */
   readonly agent: Agent
   /** Exact text following the registered command name, including separator whitespace. */
   readonly rawInput: string
+  /** Durable source just recorded in this invocation's `command/run` event. */
+  readonly source: CommandSource
   /**
    * Durably admitted image blocks accompanying this invocation, in submission
    * order; empty unless the definition declares `input.images`. The handler
@@ -75,6 +79,8 @@ interface CommandInvocation {
   readonly signal: AbortSignal
 }
 ```
+
+`CommandSource` 记录 legacy `user`、新的 `unattributed` 或带 `interaction` actor 的来源。只有由静态 `createCommandIngress(owner, actor)` 铸造的不透明 `CommandIngress` 才能进入 `executeTrustedCommand()`；这两个 helper 都不是 `ctx.commands` 或动态 Cordis capability，命令 wire 数据绝不包含 actor。`CommandGuard` 是在异步准入后求值的作用域感知同步单调拒绝；随后 runtime 会重验 command／ingress identity 和实时会话的 required extension，才进入 handler。
 
 ```ts type-equiv
 /** Expected command outcome rendered directly by the dispatching UI. */
@@ -137,6 +143,15 @@ Human-command registry. Plain-context definitions are global; definitions regist
  * @returns the exact effect disposer that unregisters this definition.
  */
 register(definition: CommandDefinition): () => void
+
+/**
+ * Register a monotonic final admission guard. Plain-context guards apply
+ * globally; a guard installed through `agent.ctx` applies only to that
+ * agent and its descendants.
+ * @param guard - synchronous check; a returned string denies the handler.
+ * @returns the exact effect disposer that removes this guard.
+ */
+guard(guard: CommandGuard): () => void
 
 /**
  * List the effective immutable command descriptors for one agent.

@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-08-22-interaction-actor-provenance-and-last-mile-admission.md
+2026-08-22-interaction-actor-provenance-and-last-mile-admission.md: d2eb262d0f092c2f99a071fdca0b36aa4a74f771
+2026-08-22-interaction-actor-provenance-and-last-mile-admission.zh.md: c8bace49787b7a1f326ac31a483178eb0afae9aa

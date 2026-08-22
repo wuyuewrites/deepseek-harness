@@ -28,6 +28,8 @@ type ApprovalRequestId = Branded<'ApprovalRequestId'>
 type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 ```
 
+`InteractionActor` 是封闭的宿主证明记录：`interactive-user` 仅限经验证的 Web 或 CLI ingress，而通用 API 与 ACP 客户端属于 `external-client`；automation、policy 与 system 决定保持不同种类。`ApprovalDecision` 是持久化的结果加 actor 视图。应答者不能提交这种结构：`ApprovalAnswer` 只允许 legacy bare 结果，或由 `createApprovalIngress(owner, actor)` 铸造并绑定 exact service、请求、作用域与 owner 生命周期的不透明答案。`requiredActor: 'interactive-user'` 会持久化到 `approval/asked`；只有 actor 匹配的不透明 `allowed-once` 仍是授权。旧 bare 事件仍可读取，但永远不满足该要求。
+
 ## 按会话策略
 
 `ApprovalPolicy` 决定在交互式应答者运行之前发生什么。`ask` 委托给组合的应答者链，链的无应答默认值为 `unavailable`；`never` 确定性地返回 `rejected`，不分发任何应答者。生效值为会话日志中最后一条 `approval/policy` 事件，回退到服务配置。`setApprovalPolicy(session, policy)` 是唯一的写入路径，因此回放能重建覆盖值。
@@ -74,6 +76,12 @@ interface ApprovalRequest {
   /** The asker's human-readable explanation of WHY it is asking. */
   readonly reason?: string
   /**
+   * Require a host-attested actor kind before `allowed-once` can reach the
+   * caller. A bare legacy outcome becomes `unavailable` when it cannot prove
+   * this requirement.
+   */
+  readonly requiredActor?: RequiredInteractionActor
+  /**
    * Aborting withdraws the question: the request settles `'cancelled'`
    * immediately and a late answer from a still-pending answerer is discarded.
    */
@@ -83,7 +91,7 @@ interface ApprovalRequest {
 
 ## 分发与审计
 
-`ctx.approval.request(req)` 要求发起请求的会话处于一个尚未结束的轮次内。它追加 `approval/asked`，获取一个结果，追加对应的 `approval/decided`，然后以该结果完成。`never` 策略在服务内部、waterfall 分发之前强制执行，因此即使后来以 `prepend` 注册的应答者也无法绕过它。应答者在负责处理该请求时返回结果，否则调用 `next()` 委托；第一个应答占据唯一的决策槽位。
+`ctx.approval.request(req)` 要求发起请求的会话处于一个尚未结束的轮次内。它会快照请求、追加 `approval/asked`、取得一个应答、追加对应的 `approval/decided`，然后以闭合结果完成。`never` 策略在服务内部、waterfall 分发之前强制执行，因此即使后来以 `prepend` 注册的应答者也无法绕过它。应答者在负责该请求时返回 legacy 结果或不透明宿主 ingress 答案，否则调用 `next()` 委托；第一个应答占据唯一的决策槽位。ingress 工厂是静态模块 API，不属于 `ctx.approval` 或动态 Cordis capability。通用 API 或 ACP 应答不是 interactive-user 溯源。
 
 审计事件仅写入日志，不进入模型 transcript（文本记录）。模型可见的行为是调用方派生的工具结果与当前运行时上下文快照。服务 dispose（资源释放）时会移除其上下文贡献；应答者监听器独立地通过 effect 绑定到其所属插件。
 
@@ -151,17 +159,18 @@ Source: [`packages/interaction/user-approval/src/index.ts`](../../packages/inter
 
 #### `approval/request` — waterfall
 
-Ask composed answerers for one decision. Return an outcome to claim the request or call `next()`; failure yields the fail-closed default. Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
+Ask composed answerers for one decision. Return a legacy outcome or an opaque Host-ingress answer to claim the request, or call `next()`; failure yields the fail-closed default. Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
 
 ```ts cordis-catalog
 /**
- * Ask composed answerers for one decision. Return an outcome to claim the
- * request or call `next()`; failure yields the fail-closed default.
+ * Ask composed answerers for one decision. Return a legacy outcome or an
+ * opaque Host-ingress answer to claim the request, or call `next()`;
+ * failure yields the fail-closed default.
  * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
  * @param req - the pending decision (agent, tool identity, reason, signal).
  * @mode waterfall
  */
-'approval/request'(this: Scoped<ApprovalService>, req: ApprovalRequest, next: () => Promise<ApprovalOutcome>): Promise<ApprovalOutcome>
+'approval/request'(this: Scoped<ApprovalService>, req: ApprovalRequest, next: () => Promise<ApprovalAnswer>): Promise<ApprovalAnswer>
 ```
 
 Types: [Scoped](scope.zh.md)

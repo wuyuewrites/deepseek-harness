@@ -573,6 +573,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the exact effect disposer that unregisters this definition.',
       },
       {
+        signature: 'guard(guard: CommandGuard): () => void',
+        description: 'Register a monotonic final admission guard. Plain-context guards apply globally; a guard installed through `agent.ctx` applies only to that agent and its descendants.',
+        parameters: [{ name: 'guard', description: 'synchronous check; a returned string denies the handler.' }],
+        returns: 'the exact effect disposer that removes this guard.',
+      },
+      {
         signature: '@Remote list(agent: Agent): readonly CommandDescriptor[]',
         description: 'List the effective immutable command descriptors for one agent.',
         parameters: [{ name: 'agent', description: 'exact receiving agent and scoped-layer key.' }],
@@ -1468,6 +1474,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         signature: 'assertEventExtensionsCompatible(session: Session): void',
         description: 'Check whether the calling scope can interpret every required carrier in a detached or live session. Read-only inspection never calls this method.',
         parameters: [{ name: 'session', description: 'session whose required carrier records are checked.' }],
+      },
+      {
+        signature: 'assertLiveEventExtensionsCompatible(session: Session): void',
+        description: 'Check one live session against the extension registrations visible from the scope captured when that exact session entered this store. Consumers call this immediately before an effectful body so a global runtime cannot borrow its own scope or outlive an owner-scoped registration.',
+        parameters: [{ name: 'session', description: 'the exact live session whose captured owner scope applies.' }],
+        throws: ['when the session is detached or a required extension is unavailable.'],
       },
       {
         signature: 'create(id?: SessionId, options?: CreateSessionOptions): Session',
@@ -2491,9 +2503,9 @@ export const EVENT_API: readonly EventApiEntry[] = [
   {
     name: 'approval/request',
     mode: 'waterfall',
-    signature: '\'approval/request\'(this: Scoped<ApprovalService>, req: ApprovalRequest, next: () => Promise<ApprovalOutcome>): Promise<ApprovalOutcome>',
+    signature: '\'approval/request\'(this: Scoped<ApprovalService>, req: ApprovalRequest, next: () => Promise<ApprovalAnswer>): Promise<ApprovalAnswer>',
     summary: 'Ask composed answerers for one decision.',
-    description: 'Ask composed answerers for one decision. Return an outcome to claim the request or call `next()`; failure yields the fail-closed default. Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.',
+    description: 'Ask composed answerers for one decision. Return a legacy outcome or an opaque Host-ingress answer to claim the request, or call `next()`; failure yields the fail-closed default. Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.',
     parameters: [{ name: 'req', description: 'the pending decision (agent, tool identity, reason, signal).' }],
   },
   {
@@ -2897,6 +2909,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface ApiKeyRecord {\n    readonly kind: \'api-key\';\n    readonly key?: string;\n    readonly env?: Readonly<Record<string, string>>;\n}',
   },
   {
+    name: 'ApprovalAnswer',
+    declaration: 'export type ApprovalAnswer = ApprovalOutcome | OpaqueApprovalAnswer;',
+  },
+  {
     name: 'ApprovalOutcome',
     declaration: 'export type ApprovalOutcome = \'allowed-once\' | \'rejected\' | \'cancelled\' | \'unavailable\';',
   },
@@ -2906,7 +2922,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'ApprovalRequest',
-    declaration: 'export interface ApprovalRequest {\n    readonly agent: Agent;\n    readonly toolName: string;\n    readonly callId?: CallId;\n    readonly reason?: string;\n    readonly signal?: AbortSignal;\n}',
+    declaration: 'export interface ApprovalRequest {\n    readonly agent: Agent;\n    readonly toolName: string;\n    readonly callId?: CallId;\n    readonly reason?: string;\n    readonly requiredActor?: RequiredInteractionActor;\n    readonly signal?: AbortSignal;\n}',
   },
   {
     name: 'ApprovalService',
@@ -3085,6 +3101,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface CommandExecution {\n    readonly commandId: CommandId;\n    readonly result: CommandResult;\n}',
   },
   {
+    name: 'CommandGuard',
+    declaration: 'export type CommandGuard = (invocation: Readonly<CommandInvocation>) => string | undefined;',
+  },
+  {
     name: 'CommandId',
     declaration: 'export type CommandId = Branded<\'CommandId\'>;',
   },
@@ -3094,11 +3114,19 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'CommandInvocation',
-    declaration: 'export interface CommandInvocation {\n    readonly commandId: CommandId;\n    readonly agent: Agent;\n    readonly rawInput: string;\n    readonly attachments: readonly ImageBlock[];\n    readonly signal: AbortSignal;\n}',
+    declaration: 'export interface CommandInvocation {\n    readonly commandId: CommandId;\n    readonly name: string;\n    readonly agent: Agent;\n    readonly rawInput: string;\n    readonly source: CommandSource;\n    readonly attachments: readonly ImageBlock[];\n    readonly signal: AbortSignal;\n}',
   },
   {
     name: 'CommandResult',
     declaration: 'export type CommandResult = {\n    readonly kind: \'success\';\n    readonly text?: string;\n    readonly sourceEventSeq?: number;\n} | {\n    readonly kind: \'error\';\n    readonly text: string;\n};',
+  },
+  {
+    name: 'CommandSource',
+    declaration: 'export type CommandSource = CommandSourceMap[keyof CommandSourceMap];',
+  },
+  {
+    name: 'CommandSourceMap',
+    declaration: 'export type CommandSourceMap = {\n    user: {\n        kind: \'user\';\n    };\n    unattributed: {\n        kind: \'unattributed\';\n    };\n    interaction: {\n        kind: \'interaction\';\n        actor: InteractionActor;\n    };\n};',
   },
   {
     name: 'CompactionAgentContext',
@@ -3501,6 +3529,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export type IndexInjectionPlacement = \'head\' | \'body\';',
   },
   {
+    name: 'InteractionActor',
+    declaration: 'export type InteractionActor = {\n    readonly kind: \'interactive-user\';\n    readonly channel: \'web\' | \'cli\';\n    readonly principalId?: string;\n} | {\n    readonly kind: \'external-client\';\n    readonly channel: \'api\' | \'acp\';\n    readonly clientId?: string;\n} | {\n    readonly kind: \'automation\';\n    readonly provider: string;\n} | {\n    readonly kind: \'policy\';\n    readonly policy: string;\n} | {\n    readonly kind: \'system\';\n};',
+  },
+  {
     name: 'InvariantFailure',
     declaration: 'export type InvariantFailure = (message: string) => never;',
   },
@@ -3817,6 +3849,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface OneShotSubagentDescriptorData extends SubagentDescriptorBase {\n    readonly mode: \'one-shot\';\n    readonly label?: string;\n}',
   },
   {
+    name: 'OpaqueApprovalAnswer',
+    declaration: 'export interface OpaqueApprovalAnswer {\n    readonly [ApprovalAnswerBrand]: never;\n}',
+  },
+  {
     name: 'PermissionSelect',
     declaration: 'export interface PermissionSelect {\n    options: PresetOption[];\n    currentValue: string;\n}',
   },
@@ -3947,6 +3983,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'RequestRunOutcome',
     declaration: 'export type RequestRunOutcome = \'approved\' | \'completed\' | \'rejected\' | \'cancelled\' | \'failed\';',
+  },
+  {
+    name: 'RequiredInteractionActor',
+    declaration: 'export type RequiredInteractionActor = \'interactive-user\';',
   },
   {
     name: 'ResolvedAlwaysRetryPolicy',

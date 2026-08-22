@@ -125,6 +125,27 @@ describe('sandbox context façade — escape surface is closed', () => {
     expect(text(result)).toBe('host-fetched')
   })
 
+  it('preserves a dynamic provided service method\'s ordinary this binding', async () => {
+    const harness = await setup()
+    await mount(harness, `
+      return {
+        name: 'stateful-provider',
+        apply(ctx) {
+          ctx.provide('statefulCounter', {
+            value: 0,
+            increment() {
+              this.value += 1
+              return this.value
+            },
+          })
+        },
+      }
+    `)
+    const counter = harness.ctx.get('statefulCounter') as { increment(): number }
+    expect(counter.increment()).toBe(1)
+    expect(counter.increment()).toBe(2)
+  })
+
   it('reads a symbol property as undefined and answers the `in` operator without throwing', async () => {
     const harness = await setup()
     await expect(mount(harness, `

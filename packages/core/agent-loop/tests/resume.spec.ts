@@ -1,4 +1,4 @@
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { CallId, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -8,7 +8,7 @@ import LlmRuntime from '@deepseek-ai/dsh-llm'
 import SessionStore, { SESSION_FORMAT_VERSION, Session, SessionExtensionCompatibilityError, SessionId, SessionPreparation } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionExtensionDescriptor, SessionHeader } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRuntime from '@deepseek-ai/dsh-tools'
+import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
@@ -131,6 +131,41 @@ describe('the session-persistence Agent Note: AgentLoop factory create/resume', 
       },
     })
     expect(handle.agent.session.events.some(event => event.type === 'session-extension/event')).toBe(true)
+    await handle.dispose()
+    await ctx.fiber.dispose()
+  })
+
+  it('uses the resumed agent scope for the tool body last-mile extension check', async () => {
+    const sessionId = SessionId('extension-resume-tool-body')
+    const first = await persistentHarness(new MockAdapter([]))
+    const registration = first.ctx.sessions.registerEventExtension(REQUIRED_EXTENSION)
+    const session = first.ctx.sessions.create(sessionId, { seed: [
+      { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
+      { type: 'turn/end', seq: 1, time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
+    ] })
+    registration.append(session, { value: 'persisted' })
+    await first.ctx.sessions.flush(session)
+    await first.ctx.fiber.dispose()
+
+    const ctx = await mountPersistentHarness(first.root, new MockAdapter([]))
+    let bodyCalls = 0
+    ctx.tools.register(defineContentToolFixture({
+      name: 'resume-extension-check', description: 'resume extension check', parameters: {},
+      async execute() { bodyCalls += 1; return [{ type: 'text', text: 'ok' }] },
+    }))
+    const handle = await ctx.agents.resume({
+      resumeSessionId: sessionId,
+      setup: (agentCtx) => { agentCtx.sessions.registerEventExtension(REQUIRED_EXTENSION) },
+    })
+
+    await expect(ctx.tools.execute({
+      agent: handle.agent,
+      callId: CallId('resume-extension-check'),
+      name: 'resume-extension-check',
+      arguments: {},
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({ isError: false })
+    expect(bodyCalls).toBe(1)
     await handle.dispose()
     await ctx.fiber.dispose()
   })

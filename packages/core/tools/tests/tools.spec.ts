@@ -3,6 +3,9 @@ import { Context } from '@deepseek-ai/cordis'
 import { createUserMessage, CallId, HarnessError, type ContentBlock  } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { createScope } from '@deepseek-ai/dsh-scope'
+import type { Scope } from '@deepseek-ai/dsh-scope'
+import SessionStore, { Session, SessionId, type SessionExtensionDescriptor } from '@deepseek-ai/dsh-session'
 import ApprovalService, { type ApprovalOutcome, type ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import ToolRuntime, {
   defineContentToolFixture, defineTool, JsonSchemaError, parameterSchemaSpecToJsonSchema, validateArgs, ToolArgsError, ToolNotFoundError,
@@ -13,8 +16,16 @@ import ToolRuntime, {
 
 const testToolSignal = new AbortController().signal
 
+declare module '@deepseek-ai/dsh-session/types' {
+  interface SessionExtensionMap {
+    'test/tool-required-state': { value: string }
+    'test/tool-started-state': { value: string }
+  }
+}
+
 async function setup() {
   const ctx = new Context()
+  await ctx.plugin(SessionStore)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
   return ctx
@@ -723,10 +734,10 @@ describe('ToolRuntime', () => {
      * `agent.session.append` and folds `.events`; the seeded open turn
      * satisfies request()'s enclosure precondition.
      */
-    function fakeAgent(): Agent {
-      return {
-        session: { events: [{ type: 'turn/start' }], append: () => ({}) },
-      } as unknown as Agent
+    function fakeAgent(ctx: Context): Agent {
+      const session = ctx.sessions.create()
+      session.append('turn/start', { turn: 1 })
+      return { id: session.id, session } as Agent
     }
 
     async function approvalSetup() {
@@ -738,7 +749,7 @@ describe('ToolRuntime', () => {
 
     it('dispatches the tool when the answerer grants allowed-once, forwarding the ask fields', async () => {
       const ctx = await approvalSetup()
-      const agent = fakeAgent()
+      const agent = fakeAgent(ctx)
       const controller = new AbortController()
       const seen: ApprovalRequest[] = []
       ctx.on('approval/request', (req) => {
@@ -763,7 +774,7 @@ describe('ToolRuntime', () => {
       ctx.on('approval/request', () => Promise.resolve<ApprovalOutcome>('rejected'))
       ctx.on('tools/pre-execute', async (_exec, _next): Promise<PreToolDecision> => ({ kind: 'ask' }))
 
-      const result = await ctx.tools.execute({ signal: testToolSignal, callId: CallId('c1'), name: 'echo', arguments: {}, agent: fakeAgent() })
+      const result = await ctx.tools.execute({ signal: testToolSignal, callId: CallId('c1'), name: 'echo', arguments: {}, agent: fakeAgent(ctx) })
       expect(result.isError).toBe(true)
       expect(result.content[0]).toMatchObject({ text: 'Error: the user rejected tool "echo"' })
     })
@@ -773,7 +784,7 @@ describe('ToolRuntime', () => {
       ctx.on('approval/request', () => Promise.resolve<ApprovalOutcome>('cancelled'))
       ctx.on('tools/pre-execute', async (_exec, _next): Promise<PreToolDecision> => ({ kind: 'ask' }))
 
-      const result = await ctx.tools.execute({ signal: testToolSignal, callId: CallId('c1'), name: 'echo', arguments: {}, agent: fakeAgent() })
+      const result = await ctx.tools.execute({ signal: testToolSignal, callId: CallId('c1'), name: 'echo', arguments: {}, agent: fakeAgent(ctx) })
       expect(result.isError).toBe(true)
       expect(result.content[0]).toMatchObject({ text: 'Error: approval for tool "echo" was cancelled' })
     })
@@ -798,7 +809,7 @@ describe('ToolRuntime', () => {
         callId: CallId('approval-cancelled'),
         name: 'approval-probe',
         arguments: {},
-        agent: fakeAgent(),
+        agent: fakeAgent(ctx),
         signal: controller.signal,
       })
 
@@ -817,7 +828,7 @@ describe('ToolRuntime', () => {
       const ctx = await approvalSetup()
       ctx.on('tools/pre-execute', async (_exec, _next): Promise<PreToolDecision> => ({ kind: 'ask' }))
 
-      const result = await ctx.tools.execute({ signal: testToolSignal, callId: CallId('c1'), name: 'echo', arguments: {}, agent: fakeAgent() })
+      const result = await ctx.tools.execute({ signal: testToolSignal, callId: CallId('c1'), name: 'echo', arguments: {}, agent: fakeAgent(ctx) })
       expect(result.isError).toBe(true)
       expect(result.content[0]).toMatchObject({ text: 'Error: tool "echo" requires approval, but no approval channel is available' })
     })
@@ -846,7 +857,7 @@ describe('ToolRuntime', () => {
       ctx.provide('approval', { request: () => Promise.resolve('yolo') } as unknown as ApprovalService)
       ctx.on('tools/pre-execute', async (_exec, _next): Promise<PreToolDecision> => ({ kind: 'ask' }))
 
-      const result = await ctx.tools.execute({ signal: testToolSignal, callId: CallId('c1'), name: 'echo', arguments: {}, agent: fakeAgent() })
+      const result = await ctx.tools.execute({ signal: testToolSignal, callId: CallId('c1'), name: 'echo', arguments: {}, agent: fakeAgent(ctx) })
       expect(result.isError).toBe(true)
       const text = result.content[0]?.type === 'text' ? result.content[0].text : ''
       expect(text).toContain('unreachable')
@@ -2446,6 +2457,140 @@ describe('schema DSL optional and nested contracts', () => {
     if (firstContent.type === 'text') {
       expect(firstContent.text).toBe('Error: [object Object]')
     }
+  })
+})
+
+describe('ToolRuntime required extension admission', () => {
+  it('preserves detached tools without required carriers but fails closed without SessionStore when one exists', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    let bodyCalls = 0
+    ctx.tools.register({
+      ...echoTool,
+      name: 'detached-extension-check',
+      async execute() { bodyCalls += 1; return 'ran' },
+    })
+    const plainSession = Session.create(SessionId('detached-plain-tool'))
+    const plainAgent = { id: plainSession.id, session: plainSession } as Agent
+
+    await expect(ctx.tools.execute({
+      signal: testToolSignal,
+      callId: CallId('detached-plain-tool'),
+      name: 'detached-extension-check',
+      arguments: {},
+      agent: plainAgent,
+    })).resolves.toMatchObject({ isError: false, value: 'ran' })
+
+    const requiredSession = Session.create(SessionId('detached-required-tool'))
+    requiredSession.append('session-extension/event', {
+      owner: '@test/tool-admission',
+      eventType: 'test/tool-required-state',
+      schemaVersion: 1,
+      requirement: 'required',
+      payload: { value: 'active' },
+    })
+    const requiredAgent = { id: requiredSession.id, session: requiredSession } as Agent
+    const denied = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: CallId('detached-required-tool'),
+      name: 'detached-extension-check',
+      arguments: {},
+      agent: requiredAgent,
+    })
+    expect(denied).toMatchObject({ isError: true })
+    expect(bodyCalls).toBe(1)
+  })
+
+  it('uses the live agent owner scope after async dispatch admission and never enters an unavailable required body', async () => {
+    const ctx = await setup()
+    const shell = {} as Agent
+    let scope!: Scope
+    await ctx.plugin(Object.assign((inner: Context) => {
+      scope = createScope(inner, shell)
+    }, { inject: ['sessions'] }))
+    const session = scope.ctx.sessions.create(SessionId('tool-required-extension'))
+    Object.assign(shell, { id: session.id, session })
+    const descriptor = {
+      owner: '@test/tool-admission', eventType: 'test/tool-required-state', schemaVersion: 1, requirement: 'required',
+    } as const satisfies SessionExtensionDescriptor<'test/tool-required-state'>
+    let registration = scope.ctx.sessions.registerEventExtension(descriptor)
+    registration.append(session, { value: 'active' })
+    let bodyCalls = 0
+    ctx.tools.register({
+      ...echoTool,
+      name: 'extension-gated',
+      async execute() { bodyCalls += 1; return 'ran' },
+    })
+
+    // ToolRuntime is global; success proves it asks SessionStore for the
+    // session entry's captured scope rather than its own global scope.
+    await expect(ctx.tools.execute({
+      signal: testToolSignal, callId: CallId('owner-scope'), name: 'extension-gated', arguments: {}, agent: shell,
+    })).resolves.toMatchObject({ isError: false, value: 'ran' })
+    expect(bodyCalls).toBe(1)
+
+    const hmr = await ctx.plugin((inner: Context) => {
+      inner.on('tools/execute', async (_exec, next) => {
+        registration.dispose()
+        return next()
+      })
+    })
+    const denied = await ctx.tools.execute({
+      signal: testToolSignal, callId: CallId('unloaded'), name: 'extension-gated', arguments: {}, agent: shell,
+    })
+    expect(denied).toMatchObject({ isError: true })
+    const deniedContent = denied.content[0]
+    expect(deniedContent?.type).toBe('text')
+    if (deniedContent?.type === 'text') {
+      expect(deniedContent.text).toContain('requires compatible session extensions')
+    }
+    expect(bodyCalls).toBe(1)
+    await hmr.dispose()
+
+    registration = scope.ctx.sessions.registerEventExtension(descriptor)
+    await expect(ctx.tools.execute({
+      signal: testToolSignal, callId: CallId('reinstalled'), name: 'extension-gated', arguments: {}, agent: shell,
+    })).resolves.toMatchObject({ isError: false, value: 'ran' })
+    expect(bodyCalls).toBe(2)
+  })
+
+  it('does not retroactively stop a body that crossed the last-mile check', async () => {
+    const ctx = await setup()
+    const shell = {} as Agent
+    let scope!: Scope
+    await ctx.plugin(Object.assign((inner: Context) => {
+      scope = createScope(inner, shell)
+    }, { inject: ['sessions'] }))
+    const session = scope.ctx.sessions.create(SessionId('tool-started-body'))
+    Object.assign(shell, { id: session.id, session })
+    const registration = scope.ctx.sessions.registerEventExtension({
+      owner: '@test/tool-admission', eventType: 'test/tool-started-state', schemaVersion: 1, requirement: 'required',
+    } as const satisfies SessionExtensionDescriptor<'test/tool-started-state'>)
+    registration.append(session, { value: 'active' })
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    let bodyCalls = 0
+    ctx.tools.register({
+      ...echoTool,
+      name: 'started-body',
+      async execute() {
+        bodyCalls += 1
+        entered.resolve(undefined)
+        await release.promise
+        return 'finished'
+      },
+    })
+
+    const pending = ctx.tools.execute({
+      signal: testToolSignal, callId: CallId('started-body'), name: 'started-body', arguments: {}, agent: shell,
+    })
+    await entered.promise
+    registration.dispose()
+    release.resolve(undefined)
+
+    await expect(pending).resolves.toMatchObject({ isError: false, value: 'finished' })
+    expect(bodyCalls).toBe(1)
   })
 })
 

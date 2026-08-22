@@ -59,10 +59,14 @@ The adapter owns cancellation and passes the exact target agent. `rawInput` begi
 interface CommandInvocation {
   /** Pairing id already written to this invocation's `command/run` event. */
   readonly commandId: CommandId
+  /** Registered command name selected by the parser. */
+  readonly name: string
   /** Exact agent whose UI received the command. */
   readonly agent: Agent
   /** Exact text following the registered command name, including separator whitespace. */
   readonly rawInput: string
+  /** Durable source just recorded in this invocation's `command/run` event. */
+  readonly source: CommandSource
   /**
    * Durably admitted image blocks accompanying this invocation, in submission
    * order; empty unless the definition declares `input.images`. The handler
@@ -75,6 +79,8 @@ interface CommandInvocation {
   readonly signal: AbortSignal
 }
 ```
+
+`CommandSource` records legacy `user`, new `unattributed`, or an `interaction` actor. Only an opaque `CommandIngress` minted by static `createCommandIngress(owner, actor)` reaches `executeTrustedCommand()`; neither helper is a `ctx.commands` or dynamic Cordis capability, and command wire data never contains an actor. `CommandGuard` is a synchronous, scope-aware monotonic denial evaluated after asynchronous admission; the runtime then revalidates command/ingress identity and the live session's required extensions before entering the handler.
 
 ```ts type-equiv
 /** Expected command outcome rendered directly by the dispatching UI. */
@@ -137,6 +143,15 @@ Human-command registry. Plain-context definitions are global; definitions regist
  * @returns the exact effect disposer that unregisters this definition.
  */
 register(definition: CommandDefinition): () => void
+
+/**
+ * Register a monotonic final admission guard. Plain-context guards apply
+ * globally; a guard installed through `agent.ctx` applies only to that
+ * agent and its descendants.
+ * @param guard - synchronous check; a returned string denies the handler.
+ * @returns the exact effect disposer that removes this guard.
+ */
+guard(guard: CommandGuard): () => void
 
 /**
  * List the effective immutable command descriptors for one agent.

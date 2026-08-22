@@ -12,7 +12,7 @@ import {
   type CompactionTrigger,
   type ManualCompactAgentContext,
 } from '@deepseek-ai/dsh-compaction'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import * as commandCompact from '@deepseek-ai/dsh-command-compact'
 
 const COMPACTION_ID = CompactionId('command-compact-test')
@@ -92,10 +92,11 @@ interface Harness {
 
 async function harness(): Promise<Harness> {
   const ctx = new Context()
+  await ctx.plugin(SessionStore)
   await ctx.plugin(CommandRuntime)
   const compact = new StubCompactionEngine(ctx)
   const plugin = await ctx.plugin(commandCompact)
-  const session = Session.create(SessionId('command-compact'))
+  const session = ctx.sessions.create(SessionId('command-compact'))
   const agent = {
     session,
     status: 'idle',
@@ -136,7 +137,7 @@ function expectLastLifecycle(
         commandId: runEvent.data.commandId,
         name: 'compact',
         args,
-        source: { kind: 'user' },
+        source: { kind: 'unattributed' },
       },
     },
     {

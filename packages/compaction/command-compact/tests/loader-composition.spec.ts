@@ -17,7 +17,7 @@ import {
   type ManualCompactAgentContext,
 } from '@deepseek-ai/dsh-compaction'
 import * as commandCompact from '@deepseek-ai/dsh-command-compact'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 
 const COMPACTION_ID = CompactionId('loader-command-compact-test')
 
@@ -84,6 +84,7 @@ describe('command-compact real Loader composition', () => {
     root = await mkdtemp(join(tmpdir(), 'dsh-command-compact-loader-'))
     const configPath = join(root, 'cordis.yml')
     await writeFile(configPath, [
+      "- name: '@deepseek-ai/dsh-session'",
       "- name: '@deepseek-ai/dsh-commands'",
       "- name: '@test/compact-backend'",
       "- name: '@deepseek-ai/dsh-command-compact'",
@@ -95,6 +96,7 @@ describe('command-compact real Loader composition', () => {
     await context.plugin(Loader)
     context.loader.builtins.include = Include
     const modules = new Map<string, unknown>([
+      ['@deepseek-ai/dsh-session', SessionStore],
       ['@deepseek-ai/dsh-commands', CommandRuntime],
       ['@test/compact-backend', LoaderCompactionEngine],
       ['@deepseek-ai/dsh-command-compact', commandCompact],
@@ -112,7 +114,7 @@ describe('command-compact real Loader composition', () => {
     })
     await context.loader.await()
 
-    const session = Session.create(SessionId('loader-command-compact'))
+    const session = context.sessions.create(SessionId('loader-command-compact'))
     const agent = {
       session,
       status: 'idle',
@@ -137,7 +139,7 @@ describe('command-compact real Loader composition', () => {
           commandId: execution.commandId,
           name: 'compact',
           args: '',
-          source: { kind: 'user' },
+          source: { kind: 'unattributed' },
         },
       },
       {

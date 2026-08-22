@@ -3,7 +3,7 @@ import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
 import { CallId } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import ApprovalService, { type ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
+import ApprovalService, { createApprovalIngress, type ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import { makeBridgeHarness, type BridgeHarness } from './harness.ts'
 
 describe('ACP machine permission policy', () => {
@@ -29,6 +29,9 @@ describe('ACP machine permission policy', () => {
     harness.onPermission = () => ({ outcome: { outcome: 'selected', optionId: 'allow-once' } })
     const request = await ownedRequest()
     await expect(harness.ctx.approval.request(request)).resolves.toBe('allowed-once')
+    expect(request.agent.session.events.findLast(event => event.type === 'approval/decided')).toMatchObject({
+      data: { outcome: 'allowed-once', decidedBy: { kind: 'external-client', channel: 'acp' } },
+    })
     expect(harness.permissionRequests[0]).toMatchObject({
       sessionId: request.agent.session.id,
       toolCall: { toolCallId: 'call-9' },
@@ -40,12 +43,51 @@ describe('ACP machine permission policy', () => {
 
     harness.onPermission = () => ({ outcome: { outcome: 'selected', optionId: 'reject-once' } })
     await expect(harness.ctx.approval.request(request)).resolves.toBe('rejected')
+    expect(request.agent.session.events.findLast(event => event.type === 'approval/decided')).toMatchObject({
+      data: { outcome: 'rejected', decidedBy: { kind: 'external-client', channel: 'acp' } },
+    })
+  })
+
+  it('delegates an interactive-user requirement without asking the ACP client', async () => {
+    harness = await makeBridgeHarness()
+    harness.onPermission = () => ({ outcome: { outcome: 'selected', optionId: 'allow-once' } })
+    const request = await ownedRequest({ requiredActor: 'interactive-user' })
+
+    await expect(harness.ctx.approval.request(request)).resolves.toBe('unavailable')
+    const decided = request.agent.session.events.findLast(event => event.type === 'approval/decided')
+    expect(decided).toMatchObject({
+      data: { outcome: 'unavailable' },
+    })
+    expect(decided?.type === 'approval/decided' && decided.data.decidedBy).toBeUndefined()
+    expect(harness.permissionRequests).toHaveLength(0)
+  })
+
+  it('delegates to a later opaque interactive provider without starving it', async () => {
+    harness = await makeBridgeHarness()
+    harness.onPermission = () => ({ outcome: { outcome: 'selected', optionId: 'allow-once' } })
+    const request = await ownedRequest({ requiredActor: 'interactive-user' })
+    const ingress = createApprovalIngress(harness.ctx, {
+      kind: 'interactive-user', channel: 'cli', principalId: 'operator-1',
+    })
+    harness.ctx.on('approval/request', request => Promise.resolve(ingress.answer(request, 'allowed-once')))
+
+    await expect(harness.ctx.approval.request(request)).resolves.toBe('allowed-once')
+    expect(harness.permissionRequests).toHaveLength(0)
+    expect(request.agent.session.events.findLast(event => event.type === 'approval/decided')).toMatchObject({
+      data: {
+        outcome: 'allowed-once',
+        decidedBy: { kind: 'interactive-user', channel: 'cli', principalId: 'operator-1' },
+      },
+    })
   })
 
   it('maps cancellation and unknown choices without granting access', async () => {
     harness = await makeBridgeHarness()
     const request = await ownedRequest()
     await expect(harness.ctx.approval.request(request)).resolves.toBe('cancelled')
+    expect(request.agent.session.events.findLast(event => event.type === 'approval/decided')).toMatchObject({
+      data: { outcome: 'cancelled', decidedBy: { kind: 'external-client', channel: 'acp' } },
+    })
     harness.onPermission = () => ({ outcome: { outcome: 'selected', optionId: 'unknown-grant' } })
     await expect(harness.ctx.approval.request(request)).resolves.toBe('rejected')
   })

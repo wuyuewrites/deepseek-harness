@@ -1,11 +1,24 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { createScope } from '@deepseek-ai/dsh-scope'
+import { bindScopeParent, createScope } from '@deepseek-ai/dsh-scope'
 import type { Scope } from '@deepseek-ai/dsh-scope'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
-import CommandRuntime, { parseCommand, type CommandDefinition } from '@deepseek-ai/dsh-commands'
+import SessionStore, { Session, SessionId, type SessionExtensionDescriptor } from '@deepseek-ai/dsh-session'
+import {
+  default as CommandRuntime,
+  createCommandIngress,
+  executeTrustedCommand,
+  parseCommand,
+  type CommandDefinition,
+  type CommandIngress,
+} from '@deepseek-ai/dsh-commands'
 import { AttachmentStore } from '@deepseek-ai/dsh-attachment'
+
+declare module '@deepseek-ai/dsh-session/types' {
+  interface SessionExtensionMap {
+    'test/command-required-state': { value: string }
+  }
+}
 
 function command(name: string, text = `ran:${name}`): CommandDefinition {
   return {
@@ -28,6 +41,18 @@ async function mintAgentScope(ctx: Context, name: string): Promise<{ scope: Scop
   const agent = { id: session.id, session } as Agent
   let scope!: Scope
   await ctx.plugin(Object.assign((inner: Context) => { scope = createScope(inner, agent) }, { inject: ['commands'] }))
+  return { scope, agent }
+}
+
+/** Mint an agent whose live session captures the same scope as its registration. */
+async function mintOwnedAgentScope(ctx: Context, name: string): Promise<{ scope: Scope; agent: Agent }> {
+  const agent = {} as Agent
+  let scope!: Scope
+  await ctx.plugin(Object.assign((inner: Context) => {
+    scope = createScope(inner, agent)
+  }, { inject: ['sessions'] }))
+  const session = scope.ctx.sessions.create(SessionId(name))
+  Object.assign(agent, { id: session.id, session })
   return { scope, agent }
 }
 
@@ -54,6 +79,35 @@ describe('parseCommand()', () => {
 })
 
 describe('CommandRuntime', () => {
+  it('preserves detached commands without required carriers but fails closed without SessionStore when one exists', async () => {
+    const ctx = new Context()
+    await ctx.plugin(CommandRuntime)
+    const plainSession = Session.create(SessionId('detached-plain-command'))
+    const plainAgent = { id: plainSession.id, session: plainSession } as Agent
+    const handler = vi.fn(() => ({ kind: 'success' as const }))
+    ctx.commands.register({ name: 'detached', description: 'Detached', handler })
+
+    await expect(ctx.commands.execute(plainAgent, '/detached', [], new AbortController().signal))
+      .resolves.toMatchObject({ result: { kind: 'success' } })
+
+    const requiredSession = Session.create(SessionId('detached-required-command'))
+    requiredSession.append('session-extension/event', {
+      owner: '@test/command-admission',
+      eventType: 'test/command-required-state',
+      schemaVersion: 1,
+      requirement: 'required',
+      payload: { value: 'active' },
+    })
+    const requiredAgent = { id: requiredSession.id, session: requiredSession } as Agent
+    await expect(ctx.commands.execute(requiredAgent, '/detached', [], new AbortController().signal))
+      .rejects.toThrow(/requires compatible session extensions/)
+    expect(handler).toHaveBeenCalledTimes(1)
+    expect(lifecycleOf(requiredAgent)).toMatchObject([
+      { type: 'command/run', data: { name: 'detached' } },
+      { type: 'command/done', data: { kind: 'error' } },
+    ])
+  })
+
   it('lists immutable global descriptors with input metadata', async () => {
     const ctx = await mount()
     const { agent } = await mintAgentScope(ctx, 'a')
@@ -307,7 +361,7 @@ describe('CommandRuntime', () => {
 
     const lifecycle = lifecycleOf(agent)
     expect(lifecycle).toMatchObject([
-      { type: 'command/run', data: { name: 'deploy', args: ' now', source: { kind: 'user' } } },
+      { type: 'command/run', data: { name: 'deploy', args: ' now', source: { kind: 'unattributed' } } },
       { type: 'command/done', data: { kind: 'success', text: 'deployed' } },
     ])
     const ids = lifecycle.map(event => (event.data as { commandId: string }).commandId)
@@ -463,6 +517,159 @@ describe('CommandRuntime', () => {
     })
     await expect(ctx.commands.execute(agent, '/broken', [], new AbortController().signal)).rejects.toThrow(expected)
   })
+
+  it('logs an error audit but never enters a handler when its required extension unloads before dispatch', async () => {
+    const ctx = await mount()
+    const { scope, agent } = await mintOwnedAgentScope(ctx, 'command-required-extension')
+    const descriptor = {
+      owner: '@test/command-admission', eventType: 'test/command-required-state', schemaVersion: 1, requirement: 'required',
+    } as const satisfies SessionExtensionDescriptor<'test/command-required-state'>
+    let registration = scope.ctx.sessions.registerEventExtension(descriptor)
+    registration.append(agent.session, { value: 'active' })
+    const handler = vi.fn(() => ({ kind: 'success' as const }))
+    ctx.commands.register({ name: 'protected', description: 'Protected', handler })
+
+    // CommandRuntime itself is global. The owner-scoped registration must be
+    // visible through the session entry captured under agent scope.
+    await expect(ctx.commands.execute(agent, '/protected', [], new AbortController().signal))
+      .resolves.toMatchObject({ result: { kind: 'success' } })
+    expect(handler).toHaveBeenCalledTimes(1)
+
+    registration.dispose()
+    await expect(ctx.commands.execute(agent, '/protected', [], new AbortController().signal))
+      .rejects.toThrow(/requires compatible session extensions/)
+    expect(handler).toHaveBeenCalledTimes(1)
+    expect(lifecycleOf(agent).slice(-2)).toMatchObject([
+      { type: 'command/run', data: { name: 'protected' } },
+      { type: 'command/done', data: { kind: 'error' } },
+    ])
+
+    registration = scope.ctx.sessions.registerEventExtension(descriptor)
+    await expect(ctx.commands.execute(agent, '/protected', [], new AbortController().signal))
+      .resolves.toMatchObject({ result: { kind: 'success' } })
+    expect(handler).toHaveBeenCalledTimes(2)
+  })
+
+  it('admits a global required extension and fails closed after its registration unloads', async () => {
+    const ctx = await mount()
+    const registration = ctx.sessions.registerEventExtension({
+      owner: '@test/command-admission',
+      eventType: 'test/command-required-state',
+      schemaVersion: 1,
+      requirement: 'required',
+    } as const satisfies SessionExtensionDescriptor<'test/command-required-state'>)
+    const session = ctx.sessions.create(SessionId('command-global-extension'))
+    const agent = { id: session.id, session } as Agent
+    registration.append(session, { value: 'active' })
+    const handler = vi.fn(() => ({ kind: 'success' as const }))
+    ctx.commands.register({ name: 'global-protected', description: 'Global protected', handler })
+
+    await expect(ctx.commands.execute(agent, '/global-protected', [], new AbortController().signal))
+      .resolves.toMatchObject({ result: { kind: 'success' } })
+    registration.dispose()
+    await expect(ctx.commands.execute(agent, '/global-protected', [], new AbortController().signal))
+      .rejects.toThrow(/requires compatible session extensions/)
+    expect(handler).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not retroactively stop a handler that crossed the last-mile check', async () => {
+    const ctx = await mount()
+    const { scope, agent } = await mintOwnedAgentScope(ctx, 'command-started-handler')
+    const registration = scope.ctx.sessions.registerEventExtension({
+      owner: '@test/command-admission',
+      eventType: 'test/command-required-state',
+      schemaVersion: 1,
+      requirement: 'required',
+    } as const satisfies SessionExtensionDescriptor<'test/command-required-state'>)
+    registration.append(agent.session, { value: 'active' })
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    let handlerCalls = 0
+    ctx.commands.register({
+      name: 'started-handler',
+      description: 'Started handler boundary',
+      async handler() {
+        handlerCalls += 1
+        entered.resolve(undefined)
+        await release.promise
+        return { kind: 'success' }
+      },
+    })
+
+    const pending = ctx.commands.execute(
+      agent, '/started-handler', [], new AbortController().signal,
+    )
+    await entered.promise
+    registration.dispose()
+    release.resolve(undefined)
+
+    await expect(pending).resolves.toMatchObject({ result: { kind: 'success' } })
+    expect(handlerCalls).toBe(1)
+  })
+
+  it('applies scoped monotonic command guards after admission and before the handler', async () => {
+    const ctx = await mount()
+    const { scope, agent } = await mintAgentScope(ctx, 'guarded-command')
+    const { agent: other } = await mintAgentScope(ctx, 'unguarded-command')
+    const handler = vi.fn(() => ({ kind: 'success' as const }))
+    ctx.commands.register({ name: 'controlled', description: 'Controlled', handler })
+    ctx.commands.guard(() => undefined)
+    const guardFiber = await scope.ctx.plugin(Object.assign((inner: Context) => {
+      inner.commands.guard(invocation => invocation.name === 'controlled' ? 'control session denies this command' : undefined)
+    }, { inject: ['commands'] }))
+
+    await expect(ctx.commands.execute(agent, '/controlled', [], new AbortController().signal))
+      .resolves.toMatchObject({ result: { kind: 'error', text: 'control session denies this command' } })
+    expect(handler).not.toHaveBeenCalled()
+    expect(lifecycleOf(agent)).toMatchObject([
+      { type: 'command/run', data: { name: 'controlled' } },
+      { type: 'command/done', data: { kind: 'error', text: 'control session denies this command' } },
+    ])
+
+    await expect(ctx.commands.execute(other, '/controlled', [], new AbortController().signal))
+      .resolves.toMatchObject({ result: { kind: 'success' } })
+    expect(handler).toHaveBeenCalledTimes(1)
+
+    await guardFiber.dispose()
+    await expect(ctx.commands.execute(agent, '/controlled', [], new AbortController().signal))
+      .resolves.toMatchObject({ result: { kind: 'success' } })
+    expect(handler).toHaveBeenCalledTimes(2)
+  })
+
+  it('records only opaque trusted-ingress actors and invalidates a scoped capability on disposal', async () => {
+    const ctx = await mount()
+    const { scope, agent } = await mintAgentScope(ctx, 'trusted-command')
+    const { agent: other } = await mintAgentScope(ctx, 'foreign-command')
+    const handler = vi.fn(() => ({ kind: 'success' as const }))
+    ctx.commands.register({ name: 'human-control', description: 'Human control', handler })
+    const ingress = createCommandIngress(scope.ctx, {
+      kind: 'interactive-user', channel: 'cli', principalId: 'operator-1',
+    })
+
+    await expect(executeTrustedCommand({} as CommandIngress, agent, '/human-control', [], new AbortController().signal))
+      .rejects.toThrow(/inactive or does not belong/)
+    expect(handler).not.toHaveBeenCalled()
+    expect(agent.session.events).toEqual([])
+
+    await expect(executeTrustedCommand(ingress, other, '/human-control', [], new AbortController().signal))
+      .rejects.toThrow(/does not own/)
+    await expect(executeTrustedCommand(ingress, agent, '/human-control', [], new AbortController().signal))
+      .resolves.toMatchObject({ result: { kind: 'success' } })
+    expect(lifecycleOf(agent)[0]).toMatchObject({
+      type: 'command/run',
+      data: {
+        source: {
+          kind: 'interaction',
+          actor: { kind: 'interactive-user', channel: 'cli', principalId: 'operator-1' },
+        },
+      },
+    })
+
+    await scope.dispose()
+    await expect(executeTrustedCommand(ingress, agent, '/human-control', [], new AbortController().signal))
+      .rejects.toThrow(/inactive/)
+    expect(handler).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('image attachments', () => {
@@ -607,6 +814,152 @@ describe('image attachments', () => {
       type: 'command/done',
       data: { kind: 'error', text: 'operator cancelled during admission' },
     })
+  })
+
+  it('rejects an unregister/reinstall race after image admission without entering either handler', async () => {
+    const ctx = await mount()
+    const store = storeOf()
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    store.saveImage.mockImplementationOnce(async (input: { mediaType: string }) => {
+      entered.resolve(undefined)
+      await release.promise
+      return { attachmentId: 'att-race', mediaType: input.mediaType, bytes: 3, width: 1, height: 1 }
+    })
+    ctx.provide('attachments', store)
+    const { agent } = await mintAgentScope(ctx, 'identity-race')
+    const oldHandler = vi.fn(() => ({ kind: 'success' as const }))
+    const newHandler = vi.fn(() => ({ kind: 'success' as const }))
+    const unregister = ctx.commands.register(accepting(oldHandler))
+
+    const pending = ctx.commands.execute(
+      agent, '/vision x', [{ mediaType: 'image/png', data: PNG }], new AbortController().signal,
+    )
+    await entered.promise
+    unregister()
+    ctx.commands.register(accepting(newHandler))
+    release.resolve(undefined)
+
+    await expect(pending).resolves.toMatchObject({
+      result: { kind: 'error', text: '/vision changed during command admission; retry the command' },
+    })
+    expect(oldHandler).not.toHaveBeenCalled()
+    expect(newHandler).not.toHaveBeenCalled()
+    const done = lifecycleOf(agent).at(-1)
+    expect(done).toMatchObject({ type: 'command/done', data: { kind: 'error' } })
+    if (done?.type !== 'command/done') throw new Error('expected command/done')
+    const doneData = done.data as { text?: unknown }
+    expect(typeof doneData.text).toBe('string')
+    if (typeof doneData.text !== 'string') throw new Error('expected command/done text')
+    expect(doneData.text).toContain('changed during command admission')
+  })
+
+  it('rechecks a required extension after async image admission before entering the handler', async () => {
+    const ctx = await mount()
+    const store = storeOf()
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    store.saveImage.mockImplementationOnce(async (input: { mediaType: string }) => {
+      entered.resolve(undefined)
+      await release.promise
+      return { attachmentId: 'att-extension', mediaType: input.mediaType, bytes: 3, width: 1, height: 1 }
+    })
+    ctx.provide('attachments', store)
+    const { scope, agent } = await mintOwnedAgentScope(ctx, 'extension-image-race')
+    const registration = scope.ctx.sessions.registerEventExtension({
+      owner: '@test/command-admission',
+      eventType: 'test/command-required-state',
+      schemaVersion: 1,
+      requirement: 'required',
+    } as const satisfies SessionExtensionDescriptor<'test/command-required-state'>)
+    registration.append(agent.session, { value: 'active' })
+    const handler = vi.fn(() => ({ kind: 'success' as const }))
+    ctx.commands.register(accepting(handler))
+
+    const pending = ctx.commands.execute(
+      agent, '/vision x', [{ mediaType: 'image/png', data: PNG }], new AbortController().signal,
+    )
+    await entered.promise
+    registration.dispose()
+    release.resolve(undefined)
+
+    await expect(pending).rejects.toThrow(/requires compatible session extensions/)
+    expect(handler).not.toHaveBeenCalled()
+    expect(lifecycleOf(agent).at(-1)).toMatchObject({
+      type: 'command/done', data: { kind: 'error' },
+    })
+  })
+
+  it('rechecks opaque ingress lifetime after image admission before the handler', async () => {
+    const ctx = await mount()
+    const store = storeOf()
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    store.saveImage.mockImplementationOnce(async (input: { mediaType: string }) => {
+      entered.resolve(undefined)
+      await release.promise
+      return { attachmentId: 'att-ingress', mediaType: input.mediaType, bytes: 3, width: 1, height: 1 }
+    })
+    ctx.provide('attachments', store)
+    const { scope, agent } = await mintAgentScope(ctx, 'ingress-race')
+    const handler = vi.fn(() => ({ kind: 'success' as const }))
+    ctx.commands.register(accepting(handler))
+    const ingress = createCommandIngress(scope.ctx, {
+      kind: 'interactive-user', channel: 'cli', principalId: 'operator-1',
+    })
+
+    const pending = executeTrustedCommand(
+      ingress, agent, '/vision x', [{ mediaType: 'image/png', data: PNG }], new AbortController().signal,
+    )
+    await entered.promise
+    await scope.dispose()
+    release.resolve(undefined)
+
+    await expect(pending).rejects.toThrow(/command ingress is inactive/)
+    expect(handler).not.toHaveBeenCalled()
+    expect(lifecycleOf(agent).at(-1)).toMatchObject({ type: 'command/done', data: { kind: 'error' } })
+  })
+
+  it('rechecks opaque ingress owner scope after image admission before the handler', async () => {
+    const ctx = await mount()
+    const store = storeOf()
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    store.saveImage.mockImplementationOnce(async (input: { mediaType: string }) => {
+      entered.resolve(undefined)
+      await release.promise
+      return { attachmentId: 'att-scope', mediaType: input.mediaType, bytes: 3, width: 1, height: 1 }
+    })
+    ctx.provide('attachments', store)
+    const ownerKey = {}
+    const foreignKey = {}
+    let ownerScope!: Scope
+    let foreignScope!: Scope
+    await ctx.plugin((inner: Context) => {
+      ownerScope = createScope(inner, ownerKey)
+      foreignScope = createScope(inner, foreignKey)
+    })
+    const session = ctx.sessions.create(SessionId('ingress-scope-race'))
+    const agent = { id: session.id, session } as Agent
+    const binding = bindScopeParent(agent, ownerKey)
+    const handler = vi.fn(() => ({ kind: 'success' as const }))
+    ctx.commands.register(accepting(handler))
+    const ingress = createCommandIngress(ownerScope.ctx, {
+      kind: 'interactive-user', channel: 'cli', principalId: 'operator-1',
+    })
+
+    const pending = executeTrustedCommand(
+      ingress, agent, '/vision x', [{ mediaType: 'image/png', data: PNG }], new AbortController().signal,
+    )
+    await entered.promise
+    binding.rebind(foreignKey)
+    release.resolve(undefined)
+
+    await expect(pending).rejects.toThrow(/scope does not own/)
+    expect(handler).not.toHaveBeenCalled()
+    expect(lifecycleOf(agent).at(-1)).toMatchObject({ type: 'command/done', data: { kind: 'error' } })
+    await foreignScope.dispose()
+    await ownerScope.dispose()
   })
 
   it('logs and rethrows a non-attachment admission failure', async () => {

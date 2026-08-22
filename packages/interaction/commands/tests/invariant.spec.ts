@@ -38,6 +38,24 @@ describe('command lifecycle invariants', () => {
     }).not.toThrow()
   })
 
+  it('accepts host-minted interaction sources and rejects malformed actor provenance', async () => {
+    const { session } = await mount()
+    session.append('command/run', {
+      commandId: CommandId('cmd-actor'),
+      name: 'human-control',
+      source: {
+        kind: 'interaction',
+        actor: { kind: 'interactive-user', channel: 'cli', principalId: 'operator-1' },
+      },
+    })
+    session.append('command/done', { commandId: CommandId('cmd-actor'), kind: 'success' })
+    expect(() => session.append('command/run', {
+      commandId: CommandId('cmd-invalid-actor'),
+      name: 'human-control',
+      source: { kind: 'interaction', actor: { kind: 'interactive-user', channel: 'api' } } as never,
+    })).toThrow(/invalid source/)
+  })
+
   it.each([-1, 1.5, 1])('rejects invalid or non-prior sourceEventSeq %s', async (sourceEventSeq) => {
     const { session } = await mount()
     appendRun(session, 'cmd-invalid')

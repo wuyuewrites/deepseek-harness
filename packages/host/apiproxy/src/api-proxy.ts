@@ -86,7 +86,8 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { SessionTitleInvalidError } from '@deepseek-ai/dsh-session-title'
 import type { CallId } from '@deepseek-ai/dsh-llm/brand'
 import type { ScopeKey } from '@deepseek-ai/dsh-scope'
-import type { ApprovalOutcome, ApprovalRequestId } from '@deepseek-ai/dsh-user-approval'
+import { createApprovalIngress } from '@deepseek-ai/dsh-user-approval'
+import type { ApprovalAnswer, ApprovalOutcome, ApprovalRequestId } from '@deepseek-ai/dsh-user-approval'
 // Side-effect type import: resolves the `approval/request` waterfall and
 // `ctx.get('approval')` without a value dependency on the seam (optional composition).
 import type {} from '@deepseek-ai/dsh-user-approval'
@@ -121,6 +122,9 @@ const SESSION_SEARCH_PROVIDER_CALL_LIMIT = 100
 const COLD_SUMMARY_BATCH_SIZE = 16
 /** Default maximum artifact size eligible for one cold blankness read. */
 export const DEFAULT_COLD_BLANK_PROBE_MAX_BYTES = 1024
+
+/** A generic API response has no host-verifiable interactive UI gesture. */
+const API_PROXY_EXTERNAL_CLIENT_ACTOR = Object.freeze({ kind: 'external-client' as const, channel: 'api' as const })
 
 /** Conversation message event types (the pagination counting unit). */
 const MESSAGE_TYPES = new Set(['user/message', 'assistant/message'])
@@ -624,7 +628,10 @@ interface PendingApproval {
   toolName: string
   callId?: CallId
   reason?: string
+  /** Settle from a validated external-client response. */
   resolve(outcome: ApprovalOutcome): void
+  /** Withdraw without attributing the Host/session cancellation to the client. */
+  cancel(): void
 }
 
 /** Project a pending entry into its answerable mux frame (initial push and mux-open replay share it). */
@@ -1352,15 +1359,17 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
   // client disconnects — mux-open replays still-pending requested frames with
   // the same rpcId (the refresh-recovery baseline) — and withdraws on the
   // ask's own abort signal (turn cancel), pushing `cancelled` to subscribers.
-  if (ctx.get('approval') !== undefined) {
+  ctx.inject(['approval'], (approvalCtx) => {
+    const approvalIngress = createApprovalIngress(approvalCtx, API_PROXY_EXTERNAL_CLIENT_ACTOR)
     // Teardown parity with the question provider above: a gateway disposed
     // while approvals are pending settles every entry as 'cancelled' (the
     // service's fail-closed vocabulary), so no ask promise dangles past the
     // proxy's lifetime and subscribers see the withdrawal.
-    ctx.effect(() => () => {
-      for (const pending of [...pendingApprovals.values()]) pending.resolve('cancelled')
+    approvalCtx.effect(() => () => {
+      for (const pending of [...pendingApprovals.values()]) pending.cancel()
     }, 'api-proxy: approval registry teardown')
-    ctx.on('approval/request', (req, next) => {
+    approvalCtx.on('approval/request', (req, next) => {
+      if (req.requiredActor !== undefined) return next()
       // Dispatch rides a microtask behind the service's own signal check: an
       // abort landing in that window would register the abort listener AFTER
       // the signal fired — never invoked, entry pending forever, zombie frame
@@ -1397,8 +1406,8 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
       // not this channel's question; delegate to the fail-closed default.
       if (approvalId === undefined) return next()
       const id = approvalId
-      return new Promise<ApprovalOutcome>((resolve) => {
-        const settle = (outcome: ApprovalOutcome): void => {
+      return new Promise<ApprovalAnswer>((resolve) => {
+        const settle = (outcome: ApprovalOutcome, externalResponse: boolean): void => {
           /* v8 ignore next 3 -- defensive double-settle guard: respond() routes
              through the pending table (a settled id is not-pending before it can
              re-settle) and the first settle removes the abort listener, so no
@@ -1409,9 +1418,12 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           // A cancelled ask was already settled by the service's own signal
           // race, which discards this late resolution; resolving is a no-op
           // there and keeps this promise from dangling forever.
-          resolve(outcome)
+          // Only a validated client response receives external-client
+          // provenance. Turn abort and Host teardown are Host withdrawals,
+          // and teardown has already invalidated this ingress capability.
+          resolve(externalResponse ? approvalIngress.answer(req, outcome) : outcome)
         }
-        const onAbort = (): void => { settle('cancelled') }
+        const onAbort = (): void => { settle('cancelled', false) }
         const pending: PendingApproval = {
           rpcId: RpcId(randomUUID()),
           sessionId: req.agent.session.id,
@@ -1419,7 +1431,8 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           toolName: req.toolName,
           ...req.callId === undefined ? {} : { callId: req.callId },
           ...req.reason === undefined ? {} : { reason: req.reason },
-          resolve: settle,
+          resolve: (outcome) => { settle(outcome, true) },
+          cancel: () => { settle('cancelled', false) },
         }
         pendingApprovals.set(pending.rpcId, pending)
         req.signal?.addEventListener('abort', onAbort, { once: true })
@@ -1427,7 +1440,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         for (const queue of muxQueues) queue.push(envelope)
       })
     })
-  }
+  })
 
   type SessionReadState = {
     id: SessionId

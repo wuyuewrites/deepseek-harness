@@ -7,6 +7,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { InvariantFailure, InvariantInstaller } from '@deepseek-ai/dsh-invariants'
+import { isCommandSource } from './codec.ts'
 
 const PACKAGE_NAME = '@deepseek-ai/dsh-commands'
 
@@ -22,6 +23,9 @@ const install: InvariantInstaller = Object.assign((ctx: Context, fail: Invariant
   const runIds = new WeakMap<Session, Set<string>>()
   const validateEvent = (session: Session, event: SessionEvent): void => {
     if (event.type === 'command/run') {
+      if (!isCommandSource(event.data.source)) {
+        fail(`command/run ${JSON.stringify(event.data.commandId)} has invalid source`)
+      }
       const ids = runIds.get(session) ?? new Set<string>()
       if (ids.has(event.data.commandId)) {
         fail(`command/run repeats commandId ${JSON.stringify(event.data.commandId)}`)

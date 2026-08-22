@@ -8,19 +8,26 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AttachmentError, admitEncodedImages } from '@deepseek-ai/dsh-attachment'
 import type { EncodedImageAttachment } from '@deepseek-ai/dsh-attachment/types'
 import type { ImageBlock } from '@deepseek-ai/dsh-llm'
-import { NamedEntries, ScopedLayers } from '@deepseek-ai/dsh-scope'
+import { AnonymousEntries, NamedEntries, ScopedLayers } from '@deepseek-ai/dsh-scope'
 import type { ScopeKey, ScopeLayer } from '@deepseek-ai/dsh-scope'
+import { assertSessionDispatchCompatible } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionEventMap } from '@deepseek-ai/dsh-session'
 import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol'
 import { CommandId } from './brand.ts'
+import { installCommandHostExecutor, resolveCommandIngress } from './command-ingress.ts'
+import type { CommandIngress } from './command-ingress.ts'
 import type {
   CommandDescriptor,
   CommandExecution,
   CommandInputDescriptor,
   CommandResult,
+  CommandSource,
 } from './types.ts'
 
 export { CommandId } from './brand.ts'
+export { createCommandIngress, executeTrustedCommand } from './command-ingress.ts'
+export type { CommandIngress } from './command-ingress.ts'
+export { interactionActorFromCommandSource, isCommandSource } from './codec.ts'
 export type * from './types.ts'
 
 export const name = 'commands'
@@ -34,10 +41,14 @@ const NO_ATTACHMENTS: readonly ImageBlock[] = Object.freeze([])
 export interface CommandInvocation {
   /** Pairing id already written to this invocation's `command/run` event. */
   readonly commandId: CommandId
+  /** Registered command name selected by the parser. */
+  readonly name: string
   /** Exact agent whose UI received the command. */
   readonly agent: Agent
   /** Exact text following the registered command name, including separator whitespace. */
   readonly rawInput: string
+  /** Durable source just recorded in this invocation's `command/run` event. */
+  readonly source: CommandSource
   /**
    * Durably admitted image blocks accompanying this invocation, in submission
    * order; empty unless the definition declares `input.images`. The handler
@@ -68,6 +79,13 @@ export interface CommandDefinition {
   readonly handler: (invocation: CommandInvocation) => CommandResult | Promise<CommandResult>
 }
 
+/**
+ * A monotonic final admission check evaluated after asynchronous command
+ * admission and immediately before a handler starts. A returned reason denies
+ * the handler; no guard can make another guard's denial an allow.
+ */
+export type CommandGuard = (invocation: Readonly<CommandInvocation>) => string | undefined
+
 /** Syntactically valid slash command before registry resolution. */
 export interface ParsedCommand {
   /** Lowercase command name without the leading slash. */
@@ -84,6 +102,7 @@ interface RegisteredCommand {
 /** All command registrations owned by one global or scoped layer. */
 class CommandLayer implements ScopeLayer {
   readonly commands: NamedEntries<RegisteredCommand>
+  readonly guards = new AnonymousEntries<CommandGuard>()
 
   /**
    * Create one command layer with diagnostics specific to its ownership scope.
@@ -97,7 +116,16 @@ class CommandLayer implements ScopeLayer {
 
   /** @returns whether this layer owns no command registrations. */
   isEmpty(): boolean {
-    return this.commands.isEmpty()
+    return this.commands.isEmpty() && this.guards.isEmpty()
+  }
+
+  /** First monotonic denial from this layer's live guard registrations. */
+  guardReason(invocation: CommandInvocation): string | undefined {
+    for (const guard of this.guards.values()) {
+      const reason = guard(invocation)
+      if (reason !== undefined) return reason
+    }
+    return undefined
   }
 }
 
@@ -260,6 +288,10 @@ export class CommandRuntime extends TypertRemoteService {
 
   constructor(ctx: Context) {
     super(ctx, 'commands')
+    ctx.effect(() => installCommandHostExecutor(
+      this,
+      (ingress, agent, line, images, signal) => this.executeFromHost(ingress, agent, line, images, signal),
+    ), 'commands.host-ingress')
   }
 
   /**
@@ -273,6 +305,21 @@ export class CommandRuntime extends TypertRemoteService {
       this.ctx,
       layer => layer.commands.insert(registered.definition.name, registered),
       { label: 'commands.register()' },
+    )
+  }
+
+  /**
+   * Register a monotonic final admission guard. Plain-context guards apply
+   * globally; a guard installed through `agent.ctx` applies only to that
+   * agent and its descendants.
+   * @param guard - synchronous check; a returned string denies the handler.
+   * @returns the exact effect disposer that removes this guard.
+   */
+  guard(guard: CommandGuard): () => void {
+    return this.layers.effect(
+      this.ctx,
+      layer => layer.guards.append(guard),
+      { label: 'commands.guard()', notify: false },
     )
   }
 
@@ -332,6 +379,30 @@ export class CommandRuntime extends TypertRemoteService {
     images: readonly EncodedImageAttachment[],
     signal: AbortSignal,
   ): Promise<CommandExecution | undefined> {
+    return this.executeAs(agent, line, images, signal, Object.freeze({ kind: 'unattributed' as const }))
+  }
+
+  /** Enter the module-private Host path after its opaque capability resolves. */
+  private executeFromHost(
+    ingress: CommandIngress,
+    agent: Agent,
+    line: string,
+    images: readonly EncodedImageAttachment[],
+    signal: AbortSignal,
+  ): Promise<CommandExecution | undefined> {
+    const source = resolveCommandIngress(this, ingress, agent)
+    return this.executeAs(agent, line, images, signal, source, ingress)
+  }
+
+  /** Execute one parsed command and record the supplied host-owned source. */
+  private async executeAs(
+    agent: Agent,
+    line: string,
+    images: readonly EncodedImageAttachment[],
+    signal: AbortSignal,
+    source: CommandSource,
+    ingress?: CommandIngress,
+  ): Promise<CommandExecution | undefined> {
     const parsed = parseCommand(line)
     if (parsed === undefined) return undefined
     const command = this.view(agent).get(parsed.name)
@@ -342,7 +413,7 @@ export class CommandRuntime extends TypertRemoteService {
       commandId,
       name: parsed.name,
       ...command.definition.recordInput === false ? {} : { args: parsed.rawInput },
-      source: { kind: 'user' },
+      source,
     })
     const settle = (result: CommandResult): CommandExecution => {
       this.appendLifecycle(agent.session, 'command/done', {
@@ -383,9 +454,24 @@ export class CommandRuntime extends TypertRemoteService {
         throw cancelledDuringAdmission
       }
     }
-    const invocation = Object.freeze({ commandId, agent, rawInput: parsed.rawInput, attachments, signal })
+    const invocation = Object.freeze({
+      commandId,
+      name: parsed.name,
+      agent,
+      rawInput: parsed.rawInput,
+      source,
+      attachments,
+      signal,
+    })
     let result: CommandResult
     try {
+      const denialReason = this.guardReason(invocation)
+      if (denialReason !== undefined) return settle({ kind: 'error', text: denialReason })
+      if (this.view(agent).get(parsed.name) !== command) {
+        return settle({ kind: 'error', text: `/${parsed.name} changed during command admission; retry the command` })
+      }
+      if (ingress !== undefined) resolveCommandIngress(this, ingress, agent)
+      assertSessionDispatchCompatible(agent.session, this.ctx.get('sessions'))
       const output = command.definition.handler(invocation)
       result = normalizeResult(parsed.name, await withAbort(Promise.resolve(output), signal))
     } catch (error: unknown) {
@@ -434,6 +520,17 @@ export class CommandRuntime extends TypertRemoteService {
   /** Resolve global definitions followed by exact scoped shadows. */
   private view(agent: Agent): Map<string, RegisteredCommand> {
     return this.layers.merge(agent, layer => layer.commands)
+  }
+
+  /** First monotonic denial from global then owner-scoped guard layers. */
+  private guardReason(invocation: CommandInvocation): string | undefined {
+    const globalReason = this.layers.global.guardReason(invocation)
+    if (globalReason !== undefined) return globalReason
+    for (const layer of this.layers.chainLayers(invocation.agent)) {
+      const reason = layer.guardReason(invocation)
+      if (reason !== undefined) return reason
+    }
+    return undefined
   }
 
   /** Notify every registry observer without making UI refresh load-bearing. */

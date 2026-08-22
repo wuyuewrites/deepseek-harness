@@ -36,6 +36,9 @@
       "path": "../../runtime-diagnostics/invariants"
     },
     {
+      "path": "../user-approval"
+    },
+    {
       "path": "../../typert/protocol"
     }
   ]

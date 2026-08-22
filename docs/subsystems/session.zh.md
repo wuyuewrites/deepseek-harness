@@ -655,6 +655,16 @@ registerEventExtension<K extends SessionExtensionType>( descriptor: SessionExten
 assertEventExtensionsCompatible(session: Session): void
 
 /**
+ * Check one live session against the extension registrations visible from
+ * the scope captured when that exact session entered this store. Consumers
+ * call this immediately before an effectful body so a global runtime cannot
+ * borrow its own scope or outlive an owner-scoped registration.
+ * @param session - the exact live session whose captured owner scope applies.
+ * @throws when the session is detached or a required extension is unavailable.
+ */
+assertLiveEventExtensionsCompatible(session: Session): void
+
+/**
  * Create a session owned by the calling fiber: disposing that fiber stops
  * event notification and removes the session from the store. `options.seed`
  * populates the session with a copy of those events (replay/fork);

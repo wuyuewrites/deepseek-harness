@@ -35,14 +35,17 @@ import {
 } from '@agentclientprotocol/sdk'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SessionId, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
-// Side-effect type import: declaration-merges the approval waterfall answered below.
-import type {} from '@deepseek-ai/dsh-user-approval'
+// Side-effect type import: declaration-merges the optional approval waterfall.
+import { createApprovalIngress } from '@deepseek-ai/dsh-user-approval'
 import { AcpContentError, admitAcpPrompt, assistantBlockToAcp, supportsAcpImagePrompts } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
 
 export const name = 'acp'
 /** The bridge creates and owns agents; every other concern is carried by the agent composition. */
 export const inject = ['agents']
+
+/** ACP is an automation transport and cannot attest an interactive-user gesture. */
+const ACP_EXTERNAL_CLIENT_ACTOR = Object.freeze({ kind: 'external-client' as const, channel: 'acp' as const })
 
 /**
  * The single continuable-subagent teardown the bridge needs. Declared
@@ -268,19 +271,24 @@ export function apply(ctx: Context, config: AcpConfig): void {
   // Permission requests are a machine policy channel for ACP clients such as
   // dsh-subagent-acp. The bridge offers one-shot choices only and never infers a
   // durable grant from an unknown client response.
-  ctx.on('approval/request', (request, next) => {
-    const record = ownedRecord(request.agent)
-    if (record === undefined || request.callId === undefined) return next()
-    return conn.requestPermission({
-      sessionId: record.agent.session.id,
-      toolCall: { toolCallId: request.callId },
-      options: [
-        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
-        { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
-      ],
-    }).then(({ outcome }) => {
-      if (outcome.outcome === 'cancelled') return 'cancelled'
-      return outcome.optionId === 'allow-once' ? 'allowed-once' : 'rejected'
+  ctx.inject(['approval'], (approvalCtx) => {
+    const approvalIngress = createApprovalIngress(approvalCtx, ACP_EXTERNAL_CLIENT_ACTOR)
+    approvalCtx.on('approval/request', (request, next) => {
+      const record = ownedRecord(request.agent)
+      if (request.requiredActor !== undefined || record === undefined || request.callId === undefined) return next()
+      return conn.requestPermission({
+        sessionId: record.agent.session.id,
+        toolCall: { toolCallId: request.callId },
+        options: [
+          { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+          { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
+        ],
+      }).then(({ outcome }) => {
+        if (outcome.outcome === 'cancelled') {
+          return approvalIngress.answer(request, 'cancelled')
+        }
+        return approvalIngress.answer(request, outcome.optionId === 'allow-once' ? 'allowed-once' : 'rejected')
+      })
     })
   })
 

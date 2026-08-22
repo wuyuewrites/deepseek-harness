@@ -26,6 +26,10 @@
       "types": "./lib/types/types.d.ts",
       "default": "./lib/types/types.js"
     },
+    "./actor": {
+      "types": "./lib/types/actor.d.ts",
+      "default": "./lib/types/actor.js"
+    },
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },

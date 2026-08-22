@@ -90,6 +90,12 @@ interface ExtensionContribution {
   active: boolean
 }
 
+interface RequiredCarrier {
+  readonly event: Extract<SessionEvent, { type: 'session-extension/event' }>
+  readonly identity: string
+  readonly requirementKey: string
+}
+
 class ExtensionLayer implements ScopeLayer {
   readonly contributions = new AnonymousEntries<ExtensionContribution>()
 
@@ -206,11 +212,7 @@ export class SessionExtensionRegistry {
   ): void {
     const visible = this.visible(scope)
     const required = new Map<string, SessionExtensionCompatibilityIssue>()
-    for (const event of events) {
-      if (event.type !== 'session-extension/event' || event.data.requirement !== 'required') continue
-      const identity = extensionKey(event.data.owner, event.data.eventType)
-      const requirementKey = `${identity}\0${event.data.schemaVersion}`
-      if (required.has(requirementKey)) continue
+    for (const { event, identity, requirementKey } of requiredCarriers(events)) {
       const registered = visible.get(identity)
       let issue: SessionExtensionCompatibilityIssue | undefined
       if (registered === undefined) {
@@ -269,6 +271,37 @@ export class SessionExtensionRegistry {
     }
     return result
   }
+}
+
+/**
+ * Build missing-registration issues when no live store can supply any registry.
+ * @param events - exact session log whose required carriers need proof.
+ * @returns one deduplicated missing-registration issue per required carrier/schema.
+ */
+export function unavailableRequiredExtensionIssues(
+  events: readonly SessionEvent[],
+): SessionExtensionCompatibilityIssue[] {
+  return requiredCarriers(events).map(({ event }) => ({
+    owner: event.data.owner,
+    eventType: event.data.eventType,
+    schemaVersion: event.data.schemaVersion,
+    firstSeq: event.seq,
+    kind: 'missing-registration',
+  }))
+}
+
+function requiredCarriers(events: readonly SessionEvent[]): RequiredCarrier[] {
+  const seen = new Set<string>()
+  const required: RequiredCarrier[] = []
+  for (const event of events) {
+    if (event.type !== 'session-extension/event' || event.data.requirement !== 'required') continue
+    const identity = extensionKey(event.data.owner, event.data.eventType)
+    const requirementKey = `${identity}\0${event.data.schemaVersion}`
+    if (seen.has(requirementKey)) continue
+    seen.add(requirementKey)
+    required.push({ event, identity, requirementKey })
+  }
+  return required
 }
 
 function collectLayer(layer: ExtensionLayer): Map<string, NormalizedDescriptor> {

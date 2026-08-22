@@ -31,7 +31,7 @@ export interface AcpConfig {
 
 依赖：`Stream`（`@agentclientprotocol/sdk`）
 
-来源：[`packages/acp/acp/src/index.ts:71`](../packages/acp/acp/src/index.ts)
+来源：[`packages/acp/acp/src/index.ts:74`](../packages/acp/acp/src/index.ts)
 
 <a id="deepseek-aidsh-acp-demo"></a>
 
@@ -3038,7 +3038,7 @@ export interface Config {
 export type ApprovalPolicy = 'ask' | 'never'
 ```
 
-来源：[`packages/interaction/user-approval/src/index.ts:177`](../packages/interaction/user-approval/src/index.ts)
+来源：[`packages/interaction/user-approval/src/index.ts:257`](../packages/interaction/user-approval/src/index.ts)
 
 <a id="deepseek-aidsh-web"></a>
 

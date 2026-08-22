@@ -11,7 +11,7 @@ import type { ScopeKey, ScopeLayer, Scoped } from '@deepseek-ai/dsh-scope'
 import type { CallId, ContentBlock, ToolSchema } from '@deepseek-ai/dsh-llm'
 import { assertNever, deepFreeze, HarnessError } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { snapshotJsonValue } from '@deepseek-ai/dsh-session'
+import { assertSessionDispatchCompatible, snapshotJsonValue } from '@deepseek-ai/dsh-session'
 import type { JsonValue, UserMessage } from '@deepseek-ai/dsh-session'
 import type { ToolProviderResult } from '@deepseek-ai/dsh-system-prompt'
 import type { CodeRuntime } from '@deepseek-ai/dsh-code-runtime'
@@ -1545,6 +1545,9 @@ export class ToolRuntime extends Service {
     try {
       const tool = this.resolveExecution(exec.name, exec.agent, exec.parent !== undefined)
       if (!tool) throw new ToolNotFoundError(exec.name)
+      if (exec.agent !== undefined) {
+        assertSessionDispatchCompatible(exec.agent.session, this.ctx.get('sessions'))
+      }
       state.bodyInvoked = true
       const returned = await tool.execute(exec.arguments, exec)
       const result = this.createSuccessResult(exec, tool, returned)

@@ -20,7 +20,9 @@ import { deriveEventMessage, isSurfaceEligibleType, SurfaceManager } from './sur
 import type { SessionSurface } from './surface.ts'
 import { foldRequestHeader } from './request-header.ts'
 import {
+  SessionExtensionCompatibilityError,
   SessionExtensionRegistry,
+  unavailableRequiredExtensionIssues,
   type SessionExtensionDescriptor,
   type SessionExtensionRegistration,
   type TypedSessionExtensionEvent,
@@ -908,6 +910,19 @@ export class SessionStore extends Service {
     this.assertEventExtensionsCompatibleAt(session, scopeOf(this.ctx))
   }
 
+  /**
+   * Check one live session against the extension registrations visible from
+   * the scope captured when that exact session entered this store. Consumers
+   * call this immediately before an effectful body so a global runtime cannot
+   * borrow its own scope or outlive an owner-scoped registration.
+   * @param session - the exact live session whose captured owner scope applies.
+   * @throws when the session is detached or a required extension is unavailable.
+   */
+  assertLiveEventExtensionsCompatible(session: Session): void {
+    const entry = this.liveEntryFor(session)
+    this.assertEventExtensionsCompatibleAt(session, entry.scope)
+  }
+
   private assertEventExtensionsCompatibleAt(
     session: Session,
     scope: ScopeKey | undefined,
@@ -1292,6 +1307,27 @@ export class SessionStore extends Service {
     return source
   }
 
+}
+
+/**
+ * Enforce required-extension compatibility at an effectful dispatch boundary.
+ * A store-owned live session uses its captured owner scope. Detached sessions
+ * preserve legacy execution only when they contain no required carrier; with
+ * one, absence of the owning live registry fails closed.
+ * @param session - exact session an agent-bearing dispatch would mutate through.
+ * @param store - composed SessionStore, or undefined in a session-less composition.
+ * @throws when a required carrier has no owner-captured live compatibility proof.
+ */
+export function assertSessionDispatchCompatible(
+  session: Session,
+  store: SessionStore | undefined,
+): void {
+  if (store?.get(session.id) === session) {
+    store.assertLiveEventExtensionsCompatible(session)
+    return
+  }
+  const issues = unavailableRequiredExtensionIssues(session.events)
+  if (issues.length > 0) throw new SessionExtensionCompatibilityError(session.id, issues)
 }
 
 export default SessionStore

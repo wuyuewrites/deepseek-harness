@@ -17,6 +17,7 @@ Creates and holds event-sourced `Session` instances. Persistence is intentionall
 - `ctx.sessions.fork(source, boundary?, childSessionId?): Session` — Resolve a live session object or id, select a seed through the inclusive `boundary` event seq (default: current last event), require that prefix to end outside an open turn, and create a live child session with lineage metadata.
 - `ctx.sessions.registerEventExtension(descriptor)` registers one scoped out-of-repository event descriptor and returns a fiber-owned append handle. Each append writes the core-known `session-extension/event` carrier with owner, event type, schema version, continuation requirement, and payload. Required carriers need an exact visible registration before live publication; ignorable carriers remain readable and resumable without their owner.
 - `ctx.sessions.assertEventExtensionsCompatible(session)` checks a detached or live session against the calling scope without publishing or mutating it.
+- `ctx.sessions.assertLiveEventExtensionsCompatible(session)` checks an exact live session against the scope captured when it entered the store; effectful runtimes call it immediately before their body so a global caller cannot borrow a different registration scope.
 - `ctx.sessions.get(id: SessionId): Session | undefined`
 - `ctx.sessions.list(): Session[]`
 
